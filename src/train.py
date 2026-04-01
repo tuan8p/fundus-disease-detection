@@ -261,10 +261,19 @@ def run_training(cfg: dict) -> None:
 
     Args:
         cfg (dict): Toàn bộ thông số từ Cell 2 của notebook.
+                    Phải có key "REPO_ROOT" để child processes tìm được src/.
     """
     world_size = torch.cuda.device_count()
     if world_size == 0:
         raise RuntimeError("Không tìm thấy GPU. Hãy kiểm tra lại môi trường.")
+
+    # mp.spawn tạo process mới với Python path trắng (không kế thừa sys.path
+    # từ notebook). Fix: set PYTHONPATH env var — được kế thừa bởi child processes.
+    repo_root = cfg.get("REPO_ROOT", "")
+    if repo_root:
+        sep = ":" if os.name != "nt" else ";"
+        existing = os.environ.get("PYTHONPATH", "")
+        os.environ["PYTHONPATH"] = repo_root + (sep + existing if existing else "")
 
     print(f"Bắt đầu DDP training trên {world_size} GPU(s)...")
     mp.spawn(
