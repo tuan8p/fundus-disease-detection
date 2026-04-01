@@ -67,17 +67,70 @@ pip install -r requirements.txt
 
 ---
 
-## Thông số mặc định
+## Cấu hình Finetune
 
-| Thành phần      | Giá trị                |
-|-----------------|------------------------|
-| Optimizer       | Adam                   |
-| LR              | 1e-4                   |
-| Epochs          | 15                     |
-| Loss            | SmoothL1 (regression)  |
-| Batch size      | 16 per GPU             |
-| Mixed Precision | AMP (FP16)             |
-| GPU             | 2× T4 (DDP)            |
+### Chiến lược học (Learning Strategy)
+
+Toàn bộ model được fine-tune end-to-end từ pretrained ImageNet weights — không đóng băng backbone. Bài toán được mô hình hóa là **ordinal regression**: model dự đoán 1 giá trị thực trong khoảng `[0, 4]`, sau đó làm tròn và clip về nhãn nguyên.
+
+```
+Pretrained backbone (ImageNet-1k)
+        ↓  fine-tune toàn bộ
+Custom head: Linear(feat_dim → 1)
+        ↓
+output: float ∈ [0, 4]  →  round().clip(0, 4)  →  label ∈ {0,1,2,3,4}
+```
+
+### Thông số mặc định
+
+| Thành phần       | Giá trị               | Ghi chú                                        |
+|------------------|-----------------------|------------------------------------------------|
+| Optimizer        | Adam                  | Không dùng weight decay                        |
+| Learning Rate    | `1e-4`                | Áp dụng đồng đều toàn bộ tham số               |
+| Epochs           | 15                    | Chỉnh `EPOCHS` trong Cell 2                    |
+| Loss function    | `SmoothL1Loss`        | Robust với outlier hơn MSE, phù hợp ordinal    |
+| Batch size       | 16 per GPU            | Effective batch = 16 × 2 GPU = 32              |
+| Mixed Precision  | AMP FP16              | `torch.amp.autocast("cuda")` + `GradScaler`    |
+| Parallelism      | DDP (NCCL)            | `mp.spawn` trên 2× T4, mỗi GPU 1 process       |
+| Best model       | Theo **val QWK**      | Lưu tại `outputs/checkpoints/`                 |
+
+### Thông số theo từng model
+
+| Model            | Input size | Params  | Batch/GPU | VRAM ước tính |
+|------------------|------------|---------|-----------|---------------|
+| EfficientNet-B7  | 456×456    | ~66M    | 16        | ~12 GB        |
+| Swin-Base        | 224×224    | ~88M    | 16        | ~10 GB        |
+
+### Preprocessing
+
+Không augmentation — chỉ resize và normalize bằng ImageNet statistics:
+
+```python
+transforms.Resize((IMAGE_SIZE, IMAGE_SIZE))
+transforms.ToTensor()
+transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+```
+
+### Metrics đánh giá
+
+| Metric              | Mô tả                                              |
+|---------------------|----------------------------------------------------|
+| **QWK** (primary)   | Quadratic Weighted Kappa — metric chính của Kaggle |
+| Accuracy            | Tỉ lệ dự đoán đúng                                 |
+| Macro F1            | F1 trung bình đồng đều giữa các lớp               |
+| Balanced Accuracy   | Accuracy có tính mất cân bằng lớp                 |
+| Per-class Recall    | Recall riêng từng lớp 0–4                          |
+| Confusion Matrix    | Ma trận nhầm lẫn (normalized theo hàng)            |
+| Classification Report | Precision / Recall / F1 chi tiết mỗi lớp        |
+| Train / Val Loss    | SmoothL1 loss theo từng epoch                      |
+
+### Lưu ý khi thay đổi thông số
+
+- **Đổi model**: thay `MODEL_TYPE` và `IMAGE_SIZE` trong Cell 2 cùng lúc
+  - `"efficientnet_b7"` → `IMAGE_SIZE = 456`
+  - `"swin_transformer"` → `IMAGE_SIZE = 224`
+- **Tăng batch size**: kiểm tra VRAM; nếu OOM thì giảm xuống 8 hoặc dùng `gradient_accumulation`
+- **Tăng epochs**: chỉnh `EPOCHS`; model sẽ tự lưu checkpoint tốt nhất theo val QWK
 
 ---
 
