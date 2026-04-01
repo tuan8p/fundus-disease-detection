@@ -98,8 +98,8 @@ output: float ∈ [0, 4]  →  round().clip(0, 4)  →  label ∈ {0,1,2,3,4}
 
 | Model            | Input size | Params  | Batch/GPU | VRAM ước tính |
 |------------------|------------|---------|-----------|---------------|
-| EfficientNet-B7  | 456×456    | ~66M    | 16        | ~12 GB        |
-| Swin-Base        | 224×224    | ~88M    | 16        | ~10 GB        |
+| EfficientNet-B7  | 456×456    | ~66M    | 8        | ~12 GB        |
+| Swin-Base        | 224×224    | ~88M    | 8        | ~10 GB        |
 
 ### Preprocessing
 
