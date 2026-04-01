@@ -77,7 +77,7 @@ def train_epoch(
         optimizer.zero_grad()
 
         with autocast():
-            outputs = model(images).squeeze(1)   # [B]
+            outputs = model(images).reshape(-1)  # [B] — an toàn cho cả [B,1] và [B]
             loss = criterion(outputs, labels)
 
         scaler.scale(loss).backward()
@@ -126,7 +126,7 @@ def val_epoch(
             labels = labels.to(device, non_blocking=True)
 
             with autocast():
-                outputs = model(images).squeeze(1)
+                outputs = model(images).reshape(-1)  # [B]
                 loss = criterion(outputs, labels)
 
             total_loss += loss.item()

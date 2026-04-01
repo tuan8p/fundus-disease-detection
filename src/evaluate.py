@@ -135,7 +135,7 @@ def run_evaluation(
             labels = labels.to(device, non_blocking=True)
 
             with autocast():
-                outputs = model(images).squeeze(1)
+                outputs = model(images).reshape(-1)  # [B]
                 loss = criterion(outputs, labels)
 
             total_loss += loss.item()

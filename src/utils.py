@@ -67,7 +67,7 @@ def load_checkpoint(
     Returns:
         dict: metadata (epoch, metrics)
     """
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     if optimizer is not None and "optimizer_state" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -107,7 +107,7 @@ def generate_submission(
         for images, _ in tqdm(submit_loader, desc="Generating submission"):
             images = images.to(device, non_blocking=True)
             with autocast():
-                outputs = model(images).squeeze(1)
+                outputs = model(images).reshape(-1)  # [B]
             preds = predict_labels(outputs)
             all_preds.extend(preds.cpu().tolist())
 
