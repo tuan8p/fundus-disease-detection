@@ -13,13 +13,16 @@ Các thành phần chính:
 
 import os
 import time
+import warnings
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
+
+# Dùng torch.amp thay vì torch.cuda.amp (tránh DeprecationWarning từ PyTorch 2.4+)
+from torch.amp import GradScaler, autocast
 
 from .dataset import get_dataloaders
 from .models import build_model, predict_labels
@@ -76,7 +79,7 @@ def train_epoch(
 
         optimizer.zero_grad()
 
-        with autocast():
+        with autocast("cuda"):
             outputs = model(images).reshape(-1)  # [B] — an toàn cho cả [B,1] và [B]
             loss = criterion(outputs, labels)
 
@@ -125,7 +128,7 @@ def val_epoch(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            with autocast():
+            with autocast("cuda"):
                 outputs = model(images).reshape(-1)  # [B]
                 loss = criterion(outputs, labels)
 
@@ -152,6 +155,9 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
         world_size : Tổng số GPU (2)
         cfg        : Dict thông số từ Cell 2 của notebook
     """
+    # Tắt toàn bộ warning trong child processes (FutureWarning, UserWarning, v.v.)
+    warnings.filterwarnings("ignore")
+
     setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
@@ -175,7 +181,7 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
     # ── Optimizer & Loss ──────────────────────────────────────────────────────
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["LR"])
     criterion = nn.SmoothL1Loss()
-    scaler    = GradScaler(enabled=cfg.get("USE_AMP", True))
+    scaler    = GradScaler("cuda", enabled=cfg.get("USE_AMP", True))
 
     # ── W&B (chỉ rank 0) ──────────────────────────────────────────────────────
     wandb_run = None
@@ -263,6 +269,9 @@ def run_training(cfg: dict) -> None:
         cfg (dict): Toàn bộ thông số từ Cell 2 của notebook.
                     Phải có key "REPO_ROOT" để child processes tìm được src/.
     """
+    # Tắt warning trong main process (FutureWarning từ mp.spawn, v.v.)
+    warnings.filterwarnings("ignore")
+
     world_size = torch.cuda.device_count()
     if world_size == 0:
         raise RuntimeError("Không tìm thấy GPU. Hãy kiểm tra lại môi trường.")

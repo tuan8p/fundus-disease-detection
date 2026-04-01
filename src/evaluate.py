@@ -17,11 +17,14 @@ Hàm chính: run_evaluation() — chạy toàn bộ pipeline evaluation trên 1 
 """
 
 import os
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
 
 from sklearn.metrics import (
     cohen_kappa_score,
@@ -134,7 +137,7 @@ def run_evaluation(
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            with autocast():
+            with autocast("cuda"):
                 outputs = model(images).reshape(-1)  # [B]
                 loss = criterion(outputs, labels)
 

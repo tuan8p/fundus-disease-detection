@@ -14,11 +14,14 @@ import os
 import zipfile
 import json
 
+import warnings
 import torch
 import torch.nn as nn
 import pandas as pd
-from torch.cuda.amp import autocast
+from torch.amp import autocast
 from tqdm import tqdm
+
+warnings.filterwarnings("ignore")
 
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
@@ -106,7 +109,7 @@ def generate_submission(
     with torch.no_grad():
         for images, _ in tqdm(submit_loader, desc="Generating submission"):
             images = images.to(device, non_blocking=True)
-            with autocast():
+            with autocast("cuda"):
                 outputs = model(images).reshape(-1)  # [B]
             preds = predict_labels(outputs)
             all_preds.extend(preds.cpu().tolist())
