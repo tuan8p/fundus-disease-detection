@@ -85,13 +85,14 @@ def build_model(model_type: str, pretrained: bool = True) -> nn.Module:
 def predict_labels(raw_output: torch.Tensor) -> torch.Tensor:
     """
     Chuyển output thực của model thành nhãn nguyên [0, 4].
+    Chấp nhận cả tensor shape [B, 1] lẫn [B] (đã squeeze trước đó).
 
     Args:
         raw_output (torch.Tensor): shape [B, 1] hoặc [B]
     Returns:
         torch.Tensor: shape [B], dtype long, giá trị trong [0, 4]
     """
-    preds = raw_output.squeeze(1)           # [B]
+    preds = raw_output.view(-1)             # flatten an toàn: [B,1] hoặc [B] → [B]
     preds = torch.round(preds).long()       # làm tròn
     preds = preds.clamp(min=0, max=4)       # clip về [0, 4]
     return preds
