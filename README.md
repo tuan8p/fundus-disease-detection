@@ -160,6 +160,7 @@ outputs/
 ├── evaluation_metrics.txt      # Bản đầy đủ: loss, QWK, F1, recall, sklearn report
 ├── classification_report.txt   # Giống nội dung evaluation_metrics.txt
 ├── wandb_run_meta.json         # id run W&B — dùng resume sau training
+├── pipeline_full_console.log   # Toàn bộ stdout/stderr notebook + log DDP rank 0
 └── outputs.zip                 # Tất cả được zip tự động
 ```
 
@@ -176,6 +177,12 @@ Dùng [Weights & Biases](https://wandb.ai) cho **toàn bộ pipeline** (không d
    - **Figures + outputs**: ảnh confusion matrix / curves / recall, artifact `pipeline_outputs` (cả thư mục `outputs/`), artifact `outputs_zip`; cuối cùng `wandb_finish_pipeline()` đóng run.
 
 File `evaluation_metrics.txt` trùng format với log console (Validation Loss, QWK, Accuracy, Macro F1, Balanced Accuracy, Per-class Recall, classification report sklearn).
+
+### Log console đầy đủ (`pipeline_full_console.log`)
+
+- **Cell 2** gọi `start_pipeline_console_capture(OUTPUT_DIR)` — mọi `print` / stderr của notebook (Cell 2→8) được **tee** vào `pipeline_full_console.log`.
+- **DDP**: tiến trình worker không dùng chung `sys.stdout` với notebook — `train.py` (rank 0) **append** từng dòng epoch, best model, kết thúc training vào cùng file.
+- **Cell 8** (sau phần in tóm tắt): `stop_pipeline_console_capture()` đóng file, rồi W&B upload artifact `pipeline_console_log` + preview HTML `pipeline/full_console_preview` (tối đa ~120k ký tự; bản đầy đủ trong artifact).
 
 ---
 

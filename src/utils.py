@@ -8,9 +8,12 @@ Các tiện ích hỗ trợ pipeline:
   - generate_submission  : Inference trên test.csv → submission.csv (format Kaggle)
   - zip_outputs          : Nén toàn bộ thư mục outputs/ thành outputs.zip
   - setup_wandb          : Khởi tạo W&B run (key từ Kaggle Secrets)
+  - start/stop_pipeline_console_capture : Tee stdout/stderr → file (notebook)
+  - append_pipeline_log_line              : Ghi thêm dòng từ DDP worker (rank 0)
 """
 
 import os
+import sys
 import html
 import zipfile
 import json
@@ -23,6 +26,110 @@ from torch.amp import autocast
 from tqdm import tqdm
 
 warnings.filterwarnings("ignore")
+
+# Tên file ghi toàn bộ print (notebook + append từ DDP rank 0)
+PIPELINE_CONSOLE_FILENAME = "pipeline_full_console.log"
+
+_orig_stdout = None
+_orig_stderr = None
+_log_fp = None
+
+
+class _TeeStream:
+    """Tee stdout/stderr: vừa in ra terminal vừa ghi vào file."""
+
+    __slots__ = ("_stream", "_log")
+
+    def __init__(self, stream, log_file):
+        self._stream = stream
+        self._log = log_file
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            try:
+                data = data.decode(getattr(self._stream, "encoding", None) or "utf-8", errors="replace")
+            except Exception:
+                data = data.decode("utf-8", errors="replace")
+        self._stream.write(data)
+        self._stream.flush()
+        if self._log:
+            self._log.write(data)
+            self._log.flush()
+
+    def flush(self):
+        self._stream.flush()
+        if self._log:
+            self._log.flush()
+
+    def isatty(self):
+        return getattr(self._stream, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def start_pipeline_console_capture(output_dir: str) -> str | None:
+    """
+    Bắt đầu ghi mọi stdout/stderr của notebook (Cell 2 trở đi) vào
+    OUTPUT_DIR/pipeline_full_console.log. Gọi một lần sau khi tạo OUTPUT_DIR.
+
+    Tiến trình DDP không kế thừa tee — dùng append_pipeline_log_line() trong train.py.
+    """
+    global _orig_stdout, _orig_stderr, _log_fp
+    if _orig_stdout is not None:
+        return os.path.join(output_dir, PIPELINE_CONSOLE_FILENAME)
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, PIPELINE_CONSOLE_FILENAME)
+    _log_fp = open(path, "w", encoding="utf-8", buffering=1)
+    _orig_stdout = sys.stdout
+    _orig_stderr = sys.stderr
+    sys.stdout = _TeeStream(_orig_stdout, _log_fp)
+    sys.stderr = _TeeStream(_orig_stderr, _log_fp)
+    _log_fp.write("=== PIPELINE CONSOLE LOG (stdout + stderr, notebook process) ===\n\n")
+    _log_fp.flush()
+    return path
+
+
+def stop_pipeline_console_capture() -> None:
+    """Tắt tee, đóng file — gọi trước khi upload log lên W&B (thường là đầu Cell 8)."""
+    global _orig_stdout, _orig_stderr, _log_fp
+    if _orig_stdout is None:
+        return
+    try:
+        if _log_fp:
+            _log_fp.write(
+                "\n=== END TEED CAPTURE (DDP lines đã append phía trên nếu có) ===\n"
+            )
+            _log_fp.flush()
+    except Exception:
+        pass
+    sys.stdout = _orig_stdout
+    sys.stderr = _orig_stderr
+    _orig_stdout, _orig_stderr = None, None
+    if _log_fp:
+        try:
+            _log_fp.close()
+        except Exception:
+            pass
+        _log_fp = None
+
+
+def append_pipeline_log_line(output_dir: str, text: str, rank: int = 0) -> None:
+    """
+    Ghi thêm một dòng vào pipeline_full_console.log (dùng trong DDP worker rank 0).
+    Không đi qua parent tee nên phải append file riêng.
+    """
+    if rank != 0:
+        return
+    path = os.path.join(output_dir, PIPELINE_CONSOLE_FILENAME)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+    except Exception:
+        pass
 
 
 # ── Checkpoint ────────────────────────────────────────────────────────────────
@@ -289,17 +396,42 @@ def log_visualization_phase_to_wandb(
     output_dir: str,
     zip_path: str | None = None,
 ) -> None:
-    """Log ảnh figure + toàn bộ thư mục outputs (artifact) + file zip nếu có."""
+    """
+    Log ảnh figure + file pipeline_full_console.log + toàn bộ thư mục outputs + zip.
+
+    Gọi **sau** stop_pipeline_console_capture() để file log đã đóng và đủ nội dung.
+    """
     if run is None:
         return
     import wandb
-    # Gom figure vào một wandb.log để cùng step (không tách nhiều step)
-    fig_log = {"pipeline/stage": "figures_and_artifacts"}
+
+    console_path = os.path.join(output_dir, PIPELINE_CONSOLE_FILENAME)
+    if os.path.isfile(console_path):
+        try:
+            c_art = wandb.Artifact("pipeline_console_log", type="console")
+            c_art.add_file(console_path)
+            run.log_artifact(c_art)
+        except Exception as e:
+            print(f"W&B artifact pipeline_console_log: {e}")
+
+    # Một step W&B: stage + preview log + figure
+    combined = {"pipeline/stage": "figures_and_artifacts"}
+    if os.path.isfile(console_path):
+        try:
+            with open(console_path, encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+            preview = raw if len(raw) <= 120_000 else raw[:120_000] + "\n\n... [truncated for W&B HTML preview] ..."
+            combined["pipeline/full_console_preview"] = wandb.Html(
+                f"<pre style='font-size:10px;white-space:pre-wrap'>{html.escape(preview)}</pre>"
+            )
+        except Exception as e:
+            print(f"W&B console preview: {e}")
     for p in figure_paths:
         if p and os.path.isfile(p):
             key = f"figures/{os.path.basename(p).replace('.', '_')}"
-            fig_log[key] = wandb.Image(p)
-    wandb.log(fig_log)
+            combined[key] = wandb.Image(p)
+    wandb.log(combined)
+
     try:
         art = wandb.Artifact("pipeline_outputs", type="run_outputs")
         if os.path.isdir(output_dir):

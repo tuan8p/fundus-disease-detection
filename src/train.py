@@ -27,7 +27,7 @@ from torch.amp import GradScaler, autocast
 from .dataset import get_dataloaders
 from .models import build_model, predict_labels
 from .evaluate import compute_qwk
-from .utils import save_checkpoint, setup_wandb, save_wandb_run_meta
+from .utils import save_checkpoint, setup_wandb, save_wandb_run_meta, append_pipeline_log_line
 
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
@@ -161,6 +161,13 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
     setup_ddp(rank, world_size)
     device = torch.device(f"cuda:{rank}")
 
+    if rank == 0:
+        append_pipeline_log_line(
+            cfg["OUTPUT_DIR"],
+            "\n--- DDP training (rank 0) — log từ worker, không qua tee notebook ---\n",
+            rank,
+        )
+
     # ── DataLoaders ──────────────────────────────────────────────────────────
     train_loader, val_loader, _, _, train_sampler = get_dataloaders(
         data_dir=cfg["DATA_DIR"],
@@ -187,6 +194,12 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
     wandb_run = None
     if rank == 0:
         wandb_run = setup_wandb(cfg)
+        if wandb_run is not None:
+            append_pipeline_log_line(
+                cfg["OUTPUT_DIR"],
+                f"W&B run (training): {getattr(wandb_run, 'url', wandb_run)}",
+                rank,
+            )
 
     os.makedirs(os.path.join(cfg["OUTPUT_DIR"], "checkpoints"), exist_ok=True)
     best_val_qwk = -1.0
@@ -211,13 +224,15 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
                 history[f"train_{k}"].append(t_metrics[k])
                 history[f"val_{k}"].append(v_metrics[k])
 
-            # Log ra console
-            print(
+            # Log ra console + file pipeline (DDP không dùng tee của notebook)
+            _line = (
                 f"Epoch [{epoch:02d}/{cfg['EPOCHS']}] "
                 f"| Time: {epoch_time:.1f}s "
                 f"| Train loss: {t_metrics['loss']:.4f}  acc: {t_metrics['acc']:.4f}  QWK: {t_metrics['qwk']:.4f} "
                 f"| Val   loss: {v_metrics['loss']:.4f}  acc: {v_metrics['acc']:.4f}  QWK: {v_metrics['qwk']:.4f}"
             )
+            print(_line)
+            append_pipeline_log_line(cfg["OUTPUT_DIR"], _line, rank)
 
             # W&B log
             if wandb_run is not None:
@@ -242,7 +257,9 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
                 )
                 # Lưu state_dict của module bên trong DDP wrapper
                 save_checkpoint(model.module, optimizer, epoch, v_metrics, ckpt_path)
-                print(f"  ✓ Best model saved  (val QWK = {best_val_qwk:.4f})")
+                _bm = f"  ✓ Best model saved  (val QWK = {best_val_qwk:.4f})"
+                print(_bm)
+                append_pipeline_log_line(cfg["OUTPUT_DIR"], _bm, rank)
 
     if rank == 0:
         if wandb_run is not None:
@@ -259,7 +276,9 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
         history_path = os.path.join(cfg["OUTPUT_DIR"], "history.json")
         with open(history_path, "w") as f:
             json.dump(history, f, indent=2)
-        print(f"\nTraining hoàn tất. Best val QWK = {best_val_qwk:.4f}")
+        _done = f"\nTraining hoàn tất. Best val QWK = {best_val_qwk:.4f}"
+        print(_done)
+        append_pipeline_log_line(cfg["OUTPUT_DIR"], _done.strip(), rank)
 
     cleanup_ddp()
 
