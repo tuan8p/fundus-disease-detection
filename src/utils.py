@@ -5,7 +5,7 @@ Các tiện ích hỗ trợ pipeline:
 
   - save_checkpoint      : Lưu model state_dict + optimizer + metadata
   - load_checkpoint      : Load lại checkpoint, trả về model + metadata
-  - generate_submission  : Inference trên test.csv → submission.csv (format Kaggle)
+  - generate_submission  : Inference → submission.csv trong output_dir + bản copy ra thư mục cha (submit Kaggle)
   - zip_outputs          : Nén toàn bộ thư mục outputs/ thành outputs.zip
   - setup_wandb          : Khởi tạo W&B run (key từ Kaggle Secrets)
   - start/stop_pipeline_console_capture : Tee stdout/stderr → file (notebook)
@@ -15,8 +15,9 @@ Các tiện ích hỗ trợ pipeline:
 import os
 import sys
 import html
-import zipfile
 import json
+import shutil
+import zipfile
 
 import warnings
 import torch
@@ -227,7 +228,32 @@ def generate_submission(
     df = pd.DataFrame({"id_code": image_ids, "diagnosis": all_preds})
     df.to_csv(sub_path, index=False)
     print(f"Submission saved: {sub_path}  ({len(df)} rows)")
+
+    copy_path = copy_submission_for_kaggle_submit(output_dir)
+    if copy_path:
+        print(f"Copy để submit Competition (ngoài outputs/): {copy_path}")
+
     return sub_path
+
+
+def copy_submission_for_kaggle_submit(output_dir: str, filename: str = "submission.csv") -> str | None:
+    """
+    Copy `output_dir/submission.csv` ra thư mục **cha** của `output_dir` (cùng cấp với folder outputs).
+
+    Ví dụ:
+      - OUTPUT_DIR = `/kaggle/working/outputs` → `/kaggle/working/submission.csv`
+    Trên Kaggle: dùng tab Output hoặc chọn file `submission.csv` ở root working để submit.
+
+    Returns:
+        Đường dẫn file đã copy, hoặc None nếu file nguồn không tồn tại.
+    """
+    src = os.path.join(output_dir, filename)
+    if not os.path.isfile(src):
+        return None
+    parent = os.path.dirname(os.path.abspath(output_dir.rstrip("/\\")))
+    dst = os.path.join(parent, filename)
+    shutil.copy2(src, dst)
+    return dst
 
 
 # ── Zip outputs ───────────────────────────────────────────────────────────────

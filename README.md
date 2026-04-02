@@ -142,7 +142,9 @@ train.csv (3,662 ảnh có nhãn) — stratified split
     ├── 20% Val    (~732 ảnh)   ← lưu best model (val QWK)
     └── 10% Test   (~366 ảnh)  ← held-out evaluation
 
-test.csv (1,929 ảnh không nhãn) ← inference → submission.csv
+test.csv (1,929 ảnh không nhãn) ← inference → `outputs/submission.csv`
+
+Sau khi tạo file, **`copy_submission_for_kaggle_submit`** tự copy `submission.csv` ra **thư mục cha** của `OUTPUT_DIR` (ví dụ `OUTPUT_DIR=/kaggle/working/outputs` → `/kaggle/working/submission.csv`) để submit Competition trực tiếp từ tab **Output** mà không cần vào subfolder `outputs/`.
 ```
 
 ---
@@ -156,7 +158,7 @@ outputs/
 │   ├── confusion_matrix.png
 │   ├── training_curves.png
 │   └── per_class_recall.png
-├── submission.csv              # Submit lên Kaggle
+├── submission.csv              # Bản trong outputs (và artifact W&B)
 ├── evaluation_metrics.txt      # Bản đầy đủ: loss, QWK, F1, recall, sklearn report
 ├── classification_report.txt   # Giống nội dung evaluation_metrics.txt
 ├── wandb_run_meta.json         # id run W&B — dùng resume sau training
