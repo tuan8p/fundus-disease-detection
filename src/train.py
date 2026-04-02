@@ -27,7 +27,7 @@ from torch.amp import GradScaler, autocast
 from .dataset import get_dataloaders
 from .models import build_model, predict_labels
 from .evaluate import compute_qwk
-from .utils import save_checkpoint, setup_wandb
+from .utils import save_checkpoint, setup_wandb, save_wandb_run_meta
 
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
@@ -247,6 +247,12 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
     if rank == 0:
         if wandb_run is not None:
             import wandb
+            # Giai đoạn training kết thúc — log + lưu id run để notebook resume và log tiếp eval/submit/figures
+            wandb.log({
+                "pipeline/stage": "training_complete",
+                "train/best_val_qwk": float(best_val_qwk),
+            })
+            save_wandb_run_meta(cfg["OUTPUT_DIR"], wandb.run)
             wandb.finish()
         # Lưu history để notebook đọc lại
         import json

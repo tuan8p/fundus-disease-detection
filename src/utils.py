@@ -11,6 +11,7 @@ Các tiện ích hỗ trợ pipeline:
 """
 
 import os
+import html
 import zipfile
 import json
 
@@ -180,6 +181,149 @@ def setup_wandb(cfg: dict):
     except Exception as e:
         print(f"W&B setup thất bại: {e} — tiếp tục training không có W&B.")
         return None
+
+
+# ── W&B: meta + resume full pipeline (eval → submission → figures) ───────────
+
+def save_wandb_run_meta(output_dir: str, run) -> str | None:
+    """
+    Lưu id/project/entity của run hiện tại trước khi wandb.finish() ở training.
+    Notebook sẽ đọc file này để resume và log tiếp các giai đoạn sau epoch cuối.
+    """
+    if run is None:
+        return None
+    meta = {
+        "id": run.id,
+        "project": run.project,
+        "entity": getattr(run, "entity", None) or "",
+        "name": run.name,
+        "url": getattr(run, "url", "") or "",
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, "wandb_run_meta.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+    print(f"W&B run meta saved: {path}")
+    return path
+
+
+def resume_wandb_run(output_dir: str, cfg: dict | None = None):
+    """
+    Resume cùng một W&B run (sau khi training đã finish) để log eval / submission / artifact.
+    Trả về wandb.Run hoặc None nếu không có meta / API key.
+    """
+    path = os.path.join(output_dir, "wandb_run_meta.json")
+    if not os.path.isfile(path) or not os.environ.get("WANDB_API_KEY"):
+        print("Không resume W&B (thiếu wandb_run_meta.json hoặc WANDB_API_KEY).")
+        return None
+    try:
+        import wandb
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+        wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
+        kwargs = {
+            "project": meta["project"],
+            "id": meta["id"],
+            "resume": "allow",
+        }
+        if meta.get("entity"):
+            kwargs["entity"] = meta["entity"]
+        run = wandb.init(**kwargs)
+        print(f"W&B run resumed (post-training pipeline): {getattr(run, 'url', run)}")
+        return run
+    except Exception as e:
+        print(f"W&B resume thất bại: {e}")
+        return None
+
+
+def log_eval_phase_to_wandb(run, metrics: dict, eval_txt_path: str | None = None) -> None:
+    """Log metrics internal test + file evaluation_metrics.txt lên W&B."""
+    if run is None:
+        return
+    import wandb
+    log_d = {
+        "pipeline/stage": "eval_internal_test",
+        "eval/val_loss": metrics["val_loss"],
+        "eval/qwk": metrics["qwk"],
+        "eval/accuracy": metrics["accuracy"],
+        "eval/macro_f1": metrics["macro_f1"],
+        "eval/balanced_accuracy": metrics["balanced_accuracy"],
+    }
+    for i, r in enumerate(metrics.get("per_class_recall", [])):
+        log_d[f"eval/recall_class_{i}"] = float(r)
+    txt = metrics.get("classification_report_text", "")
+    if txt:
+        safe = html.escape(txt)
+        log_d["eval/classification_report"] = wandb.Html(f"<pre style='font-size:11px'>{safe}</pre>")
+    wandb.log(log_d)
+    if eval_txt_path and os.path.isfile(eval_txt_path):
+        try:
+            art = wandb.Artifact("evaluation_metrics", type="metrics")
+            art.add_file(eval_txt_path)
+            run.log_artifact(art)
+        except Exception as e:
+            print(f"W&B artifact evaluation_metrics: {e}")
+
+
+def log_submission_phase_to_wandb(run, submission_path: str, sub_df) -> None:
+    """Log phân phối dự đoán trên tập submit + file CSV."""
+    if run is None:
+        return
+    import wandb
+    log_d = {"pipeline/stage": "submission_inference", "submission/num_rows": len(sub_df)}
+    counts = sub_df["diagnosis"].value_counts().sort_index()
+    for k, v in counts.items():
+        log_d[f"submission/count_class_{int(k)}"] = int(v)
+    wandb.log(log_d)
+    try:
+        art = wandb.Artifact("submission_csv", type="predictions")
+        art.add_file(submission_path)
+        run.log_artifact(art)
+    except Exception as e:
+        print(f"W&B artifact submission: {e}")
+
+
+def log_visualization_phase_to_wandb(
+    run,
+    figure_paths: list,
+    output_dir: str,
+    zip_path: str | None = None,
+) -> None:
+    """Log ảnh figure + toàn bộ thư mục outputs (artifact) + file zip nếu có."""
+    if run is None:
+        return
+    import wandb
+    # Gom figure vào một wandb.log để cùng step (không tách nhiều step)
+    fig_log = {"pipeline/stage": "figures_and_artifacts"}
+    for p in figure_paths:
+        if p and os.path.isfile(p):
+            key = f"figures/{os.path.basename(p).replace('.', '_')}"
+            fig_log[key] = wandb.Image(p)
+    wandb.log(fig_log)
+    try:
+        art = wandb.Artifact("pipeline_outputs", type="run_outputs")
+        if os.path.isdir(output_dir):
+            art.add_dir(output_dir)
+        run.log_artifact(art)
+    except Exception as e:
+        print(f"W&B artifact pipeline_outputs: {e}")
+    if zip_path and os.path.isfile(zip_path):
+        try:
+            zart = wandb.Artifact("outputs_zip", type="archive")
+            zart.add_file(zip_path)
+            run.log_artifact(zart)
+        except Exception as e:
+            print(f"W&B artifact zip: {e}")
+
+
+def wandb_finish_pipeline(run, message: str = "pipeline_complete") -> None:
+    """Đánh dấu pipeline kết thúc và đóng W&B run (gọi ở cell cuối notebook)."""
+    if run is None:
+        return
+    import wandb
+    wandb.log({"pipeline/stage": message})
+    wandb.finish()
+    print("W&B run đã đóng — toàn bộ pipeline đã log.")
 
 
 # ── Load history JSON ─────────────────────────────────────────────────────────

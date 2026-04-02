@@ -157,19 +157,25 @@ outputs/
 │   ├── training_curves.png
 │   └── per_class_recall.png
 ├── submission.csv              # Submit lên Kaggle
-├── classification_report.txt
+├── evaluation_metrics.txt      # Bản đầy đủ: loss, QWK, F1, recall, sklearn report
+├── classification_report.txt   # Giống nội dung evaluation_metrics.txt
+├── wandb_run_meta.json         # id run W&B — dùng resume sau training
 └── outputs.zip                 # Tất cả được zip tự động
 ```
 
 ---
 
-## Experiment Tracking
+## Experiment Tracking (Weights & Biases)
 
-Dùng [Weights & Biases](https://wandb.ai) để theo dõi:
+Dùng [Weights & Biases](https://wandb.ai) cho **toàn bộ pipeline** (không dừng sau epoch cuối):
 
-- Train/Val loss, accuracy, QWK theo từng epoch
-- Confusion matrix
-- Learning rate
+1. **Training (DDP)**: mỗi epoch — train/val loss, acc, QWK, thời gian epoch; cuối training log `pipeline/stage=training_complete`, lưu `wandb_run_meta.json`, rồi `wandb.finish()` ở worker.
+2. **Notebook resume**: Cell 6–8 gọi `resume_wandb_run()` với cùng `run id` để tiếp tục log:
+   - **Eval (held-out 10%)**: scalar metrics, bảng classification report (HTML), artifact `evaluation_metrics`.
+   - **Submission**: phân phối nhãn trên `test.csv`, artifact `submission_csv`.
+   - **Figures + outputs**: ảnh confusion matrix / curves / recall, artifact `pipeline_outputs` (cả thư mục `outputs/`), artifact `outputs_zip`; cuối cùng `wandb_finish_pipeline()` đóng run.
+
+File `evaluation_metrics.txt` trùng format với log console (Validation Loss, QWK, Accuracy, Macro F1, Balanced Accuracy, Per-class Recall, classification report sklearn).
 
 ---
 

@@ -81,6 +81,27 @@ def compute_metrics(y_true: list, y_pred: list) -> dict:
     }
 
 
+def build_evaluation_metrics_text(val_loss: float, metrics: dict, report_str: str) -> str:
+    """
+    Ghép chuỗi text đầy đủ giống output console (để lưu file / W&B).
+    """
+    lines = [
+        "=" * 60,
+        "EVALUATION RESULTS (Internal Test Set — Held-out 10%)",
+        "=" * 60,
+        f"  Validation Loss      : {val_loss:.4f}",
+        f"  QWK (primary)        : {metrics['qwk']:.4f}",
+        f"  Accuracy             : {metrics['accuracy']:.4f}",
+        f"  Macro F1             : {metrics['macro_f1']:.4f}",
+        f"  Balanced Accuracy    : {metrics['balanced_accuracy']:.4f}",
+        f"  Per-class Recall     : {[round(r, 4) for r in metrics['per_class_recall']]}",
+        "",
+        report_str.rstrip(),
+        "=" * 60,
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def get_classification_report(y_true: list, y_pred: list) -> str:
     """
     Trả về classification report dạng text (sklearn).
@@ -124,7 +145,7 @@ def run_evaluation(
         output_dir : Thư mục lưu báo cáo văn bản
 
     Returns:
-        dict: metrics + "y_true" + "y_pred" + "val_loss"
+        dict: metrics + "y_true" + "y_pred" + "val_loss" + "classification_report_text"
     """
     from .models import predict_labels
 
@@ -167,19 +188,19 @@ def run_evaluation(
     print(report_str)
     print("="*60)
 
-    # ── Lưu classification report ─────────────────────────────────────────────
+    full_text = build_evaluation_metrics_text(val_loss, metrics, report_str)
+    metrics["classification_report_text"] = report_str
+
+    # ── Lưu file text: bản đầy đủ + classification_report (tương thích cũ) ───────
     os.makedirs(output_dir, exist_ok=True)
+    eval_txt_path = os.path.join(output_dir, "evaluation_metrics.txt")
+    with open(eval_txt_path, "w", encoding="utf-8") as f:
+        f.write(full_text)
+    print(f"Evaluation metrics (full) đã lưu tại: {eval_txt_path}")
+
     report_path = os.path.join(output_dir, "classification_report.txt")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write("EVALUATION RESULTS (Internal Test Set — Held-out 10%)\n")
-        f.write("="*60 + "\n")
-        f.write(f"Validation Loss   : {val_loss:.4f}\n")
-        f.write(f"QWK (primary)     : {metrics['qwk']:.4f}\n")
-        f.write(f"Accuracy          : {metrics['accuracy']:.4f}\n")
-        f.write(f"Macro F1          : {metrics['macro_f1']:.4f}\n")
-        f.write(f"Balanced Accuracy : {metrics['balanced_accuracy']:.4f}\n")
-        f.write(f"Per-class Recall  : {metrics['per_class_recall']}\n\n")
-        f.write(report_str)
-    print(f"Classification report đã lưu tại: {report_path}")
+        f.write(full_text)
+    print(f"Classification report (same content) : {report_path}")
 
     return metrics
