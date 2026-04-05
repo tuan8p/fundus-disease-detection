@@ -18,6 +18,8 @@ from torchvision import transforms
 
 from sklearn.model_selection import train_test_split
 
+from .preprocessing import apply_preprocessing
+
 
 # ── Dataset ──────────────────────────────────────────────────────────────────
 
@@ -27,18 +29,27 @@ class APTOSDataset(Dataset):
     Nếu labels=None (tập test không nhãn), trả về (image_tensor, -1).
     """
 
-    def __init__(self, image_ids, image_dir, transform, labels=None):
+    def __init__(
+        self,
+        image_ids,
+        image_dir,
+        transform,
+        labels=None,
+        preprocessing_strategy: str = "none",
+    ):
         """
         Args:
             image_ids (list[str]): Danh sách id_code của ảnh.
             image_dir (str)      : Đường dẫn thư mục chứa ảnh (.png).
             transform            : torchvision transforms áp dụng cho ảnh.
             labels (list[int] | None): Nhãn tương ứng; None nếu tập inference.
+            preprocessing_strategy: none | roi | roi_ben | roi_imgtype | roi_ben_imgtype
         """
         self.image_ids = image_ids
         self.image_dir = image_dir
         self.transform = transform
         self.labels = labels
+        self.preprocessing_strategy = preprocessing_strategy
 
     def __len__(self):
         return len(self.image_ids)
@@ -46,6 +57,8 @@ class APTOSDataset(Dataset):
     def __getitem__(self, idx):
         img_path = os.path.join(self.image_dir, f"{self.image_ids[idx]}.png")
         image = Image.open(img_path).convert("RGB")
+        if self.preprocessing_strategy != "none":
+            image = apply_preprocessing(image, self.preprocessing_strategy)
         image = self.transform(image)
 
         label = float(self.labels[idx]) if self.labels is not None else -1.0
@@ -86,6 +99,7 @@ def get_dataloaders(
     seed: int = 42,
     rank: int = 0,
     world_size: int = 1,
+    preprocessing_strategy: str = "none",
 ):
     """
     Đọc train.csv và test.csv, tạo 4 DataLoader:
@@ -104,9 +118,10 @@ def get_dataloaders(
         seed        : Random seed để reproducibility
         rank        : Rank của tiến trình DDP (0 nếu không dùng DDP)
         world_size  : Số GPU/tiến trình DDP (1 nếu không dùng DDP)
+        preprocessing_strategy: Tiền xử lý PIL trước resize (xem preprocessing.py)
 
     Returns:
-        tuple: (train_loader, val_loader, internal_test_loader, submit_loader)
+        tuple: (train_loader, val_loader, internal_test_loader, submit_loader, train_sampler)
     """
     transform = get_transforms(image_size)
 
@@ -140,12 +155,20 @@ def get_dataloaders(
     train_dir = os.path.join(data_dir, "train_images")
     test_dir  = os.path.join(data_dir, "test_images")
 
-    train_dataset         = APTOSDataset(ids_train, train_dir, transform, lbl_train)
-    val_dataset           = APTOSDataset(ids_val,   train_dir, transform, lbl_val)
-    internal_test_dataset = APTOSDataset(ids_test,  train_dir, transform, lbl_test)
+    train_dataset         = APTOSDataset(
+        ids_train, train_dir, transform, lbl_train, preprocessing_strategy=preprocessing_strategy
+    )
+    val_dataset           = APTOSDataset(
+        ids_val, train_dir, transform, lbl_val, preprocessing_strategy=preprocessing_strategy
+    )
+    internal_test_dataset = APTOSDataset(
+        ids_test, train_dir, transform, lbl_test, preprocessing_strategy=preprocessing_strategy
+    )
 
     submit_ids    = test_csv["id_code"].tolist()
-    submit_dataset = APTOSDataset(submit_ids, test_dir, transform, labels=None)
+    submit_dataset = APTOSDataset(
+        submit_ids, test_dir, transform, labels=None, preprocessing_strategy=preprocessing_strategy
+    )
 
     # ── DistributedSampler cho DDP (chỉ train) ───────────────────────────────
     use_ddp = world_size > 1

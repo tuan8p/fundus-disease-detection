@@ -179,6 +179,7 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
         seed=cfg["SEED"],
         rank=rank,
         world_size=world_size,
+        preprocessing_strategy=cfg.get("PREPROCESSING_STRATEGY", "none"),
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
