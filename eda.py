@@ -11,6 +11,7 @@ from matplotlib.backends.backend_pdf import PdfPages # Thư viện xuất PDF
 # 1. CẤU HÌNH ĐƯỜNG DẪN
 # ==========================================
 CSV_PATH = r'D:\BTL_DL\data\train.csv'
+
 IMAGE_DIR = r'D:\BTL_DL\data\train_images/' 
 OUTPUT_CSV = 'image_eda_features.csv'
 
