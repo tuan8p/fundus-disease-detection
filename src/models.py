@@ -22,8 +22,8 @@ import timm
 
 REGISTRY = {
     "efficientnet_b7": "tf_efficientnet_b7",
-    "swin_transformer": "swin_base_patch4_window7_224",
-}
+ "swinv2_base_384": "swinv2_base_window12to24_192to384_22kft1k" # image size = 
+ }
 
 
 # ── Model wrapper ─────────────────────────────────────────────────────────────
