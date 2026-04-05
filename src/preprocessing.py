@@ -27,6 +27,9 @@ STRATEGY_ROI: Final[str] = "roi"
 STRATEGY_ROI_BEN: Final[str] = "roi_ben"
 STRATEGY_ROI_IMGT: Final[str] = "roi_imgtype"
 STRATEGY_ROI_BEN_IMGT: Final[str] = "roi_ben_imgtype"
+STRATEGY_BEN: Final[str] = "ben"
+STRATEGY_IMGT: Final[str] = "imgtype"
+STRATEGY_BEN_IMGT: Final[str] = "ben_imgtype"
 
 ALL_STRATEGIES: tuple[str, ...] = (
     STRATEGY_NONE,
@@ -34,6 +37,9 @@ ALL_STRATEGIES: tuple[str, ...] = (
     STRATEGY_ROI_BEN,
     STRATEGY_ROI_IMGT,
     STRATEGY_ROI_BEN_IMGT,
+    STRATEGY_BEN,
+    STRATEGY_IMGT,
+    STRATEGY_BEN_IMGT,
 )
 
 _DEFAULT_TOL: Final[int] = 7
@@ -128,6 +134,25 @@ def preprocess_roi_ben_imgtype(image: Image.Image) -> Image.Image:
     arr = image_type_normalize(arr)
     return Image.fromarray(arr)
 
+def preprocess_ben(image: Image.Image) -> Image.Image:
+    """Strategy 6: chỉ Ben."""
+    arr = np.array(image)
+    arr = ben_graham_scale(arr)
+    return Image.fromarray(arr)
+
+def preprocess_imgtype(image: Image.Image) -> Image.Image:
+    """Strategy 7: chỉ image type."""
+    arr = np.array(image)
+    out = image_type_normalize(arr)
+    return Image.fromarray(out)
+
+def preprocess_ben_imgtype(image: Image.Image) -> Image.Image:
+    """Strategy 8: Ben + image type."""
+    arr = np.array(image)
+    pil = ben_graham_scale(image)
+
+    out = image_type_normalize(arr)
+    return Image.fromarray(out)
 
 def preprocess_none(image: Image.Image) -> Image.Image:
     """Không đổi (baseline trước resize)."""
@@ -140,6 +165,9 @@ _PREPROCESS_FUNCS: dict[str, Callable[[Image.Image], Image.Image]] = {
     STRATEGY_ROI_BEN: preprocess_roi_ben,
     STRATEGY_ROI_IMGT: preprocess_roi_imgtype,
     STRATEGY_ROI_BEN_IMGT: preprocess_roi_ben_imgtype,
+    STRATEGY_BEN: preprocess_ben,
+    STRATEGY_IMGT: preprocess_imgtype,
+    STRATEGY_BEN_IMGT: preprocess_ben_imgtype,
 }
 
 
