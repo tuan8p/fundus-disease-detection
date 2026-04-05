@@ -79,7 +79,7 @@ def get_dataloaders(
     
     # =====================================================================
     # CHỌN PHIÊN BẢN AUGMENTATION ĐỂ CHẠY (ABLATION STUDY)
-    # Bạn chỉ cần mở comment (uncomment) bản muốn test, đóng các bản còn lại.
+    # Chỉ cần mở bản muốn test, đóng các bản còn lại.
     # =====================================================================
     # train_transform = get_train_transforms_v1_basic(image_size)
     train_transform = get_train_transforms_v2_advanced(image_size) # Đang bật V2
