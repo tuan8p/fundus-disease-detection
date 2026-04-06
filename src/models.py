@@ -22,7 +22,7 @@ import timm
 
 REGISTRY = {
     "efficientnet_b7": "tf_efficientnet_b7",
- "swinv2_base_384": "swinv2_base_window12to24_192to384_22kft1k" # image size = 
+"swinv2_base_384": "swinv2_base_window12to24_192to384_22kft1k"
  }
 
 
