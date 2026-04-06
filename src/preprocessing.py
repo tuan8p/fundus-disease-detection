@@ -40,10 +40,10 @@ ALL_STRATEGIES: tuple[str, ...] = (
 )
 
 _DEFAULT_TOL: Final[int] = 7
-_BEN_SIGMA_X: Final[float] = 30.0
+# _BEN_SIGMA_X: Final[float] = 30.0
 _BEN_MASK_RADIUS_RATIO: Final[float] = 0.45
 _CLAHE_CLIP_LIMIT: Final[float] = 1.0
-_CLAHE_TILE_SIZE: Final[int] = 16
+# _CLAHE_TILE_SIZE: Final[int] = 16
 
 def extract_roi(image: Image.Image, tol: int = _DEFAULT_TOL, pad_ratio: float = 0.05) -> Image.Image:
     """
@@ -79,13 +79,17 @@ def extract_roi(image: Image.Image, tol: int = _DEFAULT_TOL, pad_ratio: float = 
 
 def apply_ben_graham(
     rgb: np.ndarray,
-    sigma_x: float = _BEN_SIGMA_X,
+    sigma_x: float | None = None,       # None = tự tính
     mask_radius_ratio: float = _BEN_MASK_RADIUS_RATIO,
 ) -> np.ndarray:
     """
     Ben Graham (Kaggle APTOS style): high-frequency emphasis.
     output = 4*img - 4*GaussianBlur(img) + 128, với mask tròn để giảm artifact viền.
     """
+    if sigma_x is None:
+        short_side = min(rgb.shape[0], rgb.shape[1])
+        sigma_x = float(np.clip(short_side * 0.02, 10.0, 60.0))
+
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
     blur = cv2.GaussianBlur(rgb, (0, 0), sigmaX=sigma_x)
@@ -103,11 +107,18 @@ def apply_ben_graham(
 def apply_clahe_lab(
     rgb: np.ndarray,
     clip_limit: float = _CLAHE_CLIP_LIMIT,
-    tile_grid_size: int = _CLAHE_TILE_SIZE,
+    tile_grid_size: int | None = None,   # None = tự tính theo ảnh
 ) -> np.ndarray:
     """CLAHE trên kênh L của không gian LAB (ảnh RGB uint8)."""
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    # ── Tự tính tile_size nếu không truyền vào ────────────────────────────
+    if tile_grid_size is None:
+        short_side = min(rgb.shape[0], rgb.shape[1])
+        # mỗi tile ~ 1/8 cạnh ngắn, clamp vào [8, 32] để tránh cực đoan
+        tile_grid_size = int(np.clip(short_side // 8, 8, 32))
+
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     clahe = cv2.createCLAHE(
