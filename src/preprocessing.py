@@ -40,11 +40,10 @@ ALL_STRATEGIES: tuple[str, ...] = (
 )
 
 _DEFAULT_TOL: Final[int] = 7
-_BEN_SIGMA_X: Final[float] = 10.0
+_BEN_SIGMA_X: Final[float] = 30.0
 _BEN_MASK_RADIUS_RATIO: Final[float] = 0.45
-_CLAHE_CLIP_LIMIT: Final[float] = 2.0
-_CLAHE_TILE_SIZE: Final[int] = 8
-
+_CLAHE_CLIP_LIMIT: Final[float] = 1.0
+_CLAHE_TILE_SIZE: Final[int] = 16
 
 def extract_roi(image: Image.Image, tol: int = _DEFAULT_TOL, pad_ratio: float = 0.05) -> Image.Image:
     """
