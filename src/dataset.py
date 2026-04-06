@@ -43,7 +43,7 @@ class APTOSDataset(Dataset):
             image_dir (str)      : Đường dẫn thư mục chứa ảnh (.png).
             transform            : torchvision transforms áp dụng cho ảnh.
             labels (list[int] | None): Nhãn tương ứng; None nếu tập inference.
-            preprocessing_strategy: none | roi | roi_ben | roi_imgtype | roi_ben_imgtype
+            preprocessing_strategy: none | roi | roi_ben | roi_clahe | roi_ben_clahe
         """
         self.image_ids = image_ids
         self.image_dir = image_dir
@@ -118,7 +118,7 @@ def get_dataloaders(
         seed        : Random seed để reproducibility
         rank        : Rank của tiến trình DDP (0 nếu không dùng DDP)
         world_size  : Số GPU/tiến trình DDP (1 nếu không dùng DDP)
-        preprocessing_strategy: Tiền xử lý PIL trước resize (xem preprocessing.py)
+        preprocessing_strategy: Tiền xử lý PIL trước resize; xem preprocessing.py
 
     Returns:
         tuple: (train_loader, val_loader, internal_test_loader, submit_loader, train_sampler)

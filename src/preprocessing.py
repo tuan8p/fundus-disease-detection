@@ -3,15 +3,18 @@ preprocessing.py
 ------------------
 Tiền xử lý ảnh fundus (APTOS) — deterministic, áp trước Resize + ImageNet norm trong dataset.
 
-4 strategy thực nghiệm:
-  - roi              : chỉ ROI (bỏ viền đen)
-  - roi_ben          : ROI + Ben Graham (scale theo bán kính ~300px)
-  - roi_imgtype      : ROI + chuẩn hóa theo "loại ảnh" (độ sáng)
-  - roi_ben_imgtype  : ROI + Ben + image type
+Tham số căn cứ quy trình có hệ thống (grid / tài liệu APTOS):
+  - Ben Graham: unsharp mask 4*img - 4*GaussianBlur(sigmaX) + 128 (sigmaX mặc định 10)
+  - CLAHE: kênh L của LAB, clipLimit / tileGridSize có thể cấu hình
 
-Thêm "none" để tắt hoàn toàn (giữ pipeline baseline cũ: chỉ resize + norm).
+Các mode:
+  - none          : không tiền xử lý thêm (baseline: chỉ resize + norm trong transforms)
+  - roi           : chỉ ROI (bỏ viền đen, căn vuông)
+  - roi_ben       : ROI + Ben Graham
+  - roi_clahe     : ROI + CLAHE (L channel)
+  - roi_ben_clahe : ROI + Ben → CLAHE (thứ tự theo tài liệu: Ben trước, CLAHE sau)
 
-Không augmentation — chỉ preprocessing.
+Không augmentation.
 """
 
 from __future__ import annotations
@@ -25,26 +28,22 @@ from PIL import Image
 STRATEGY_NONE: Final[str] = "none"
 STRATEGY_ROI: Final[str] = "roi"
 STRATEGY_ROI_BEN: Final[str] = "roi_ben"
-STRATEGY_ROI_IMGT: Final[str] = "roi_imgtype"
-STRATEGY_ROI_BEN_IMGT: Final[str] = "roi_ben_imgtype"
-STRATEGY_BEN: Final[str] = "ben"
-STRATEGY_IMGT: Final[str] = "imgtype"
-STRATEGY_BEN_IMGT: Final[str] = "ben_imgtype"
+STRATEGY_ROI_CLAHE: Final[str] = "roi_clahe"
+STRATEGY_ROI_BEN_CLAHE: Final[str] = "roi_ben_clahe"
 
 ALL_STRATEGIES: tuple[str, ...] = (
     STRATEGY_NONE,
     STRATEGY_ROI,
     STRATEGY_ROI_BEN,
-    STRATEGY_ROI_IMGT,
-    STRATEGY_ROI_BEN_IMGT,
-    STRATEGY_BEN,
-    STRATEGY_IMGT,
-    STRATEGY_BEN_IMGT,
+    STRATEGY_ROI_CLAHE,
+    STRATEGY_ROI_BEN_CLAHE,
 )
 
 _DEFAULT_TOL: Final[int] = 7
-_BEN_TARGET_RADIUS: Final[int] = 300
-_IMGT_BRIGHT_THRESH: Final[int] = 15
+_BEN_SIGMA_X: Final[float] = 10.0
+_BEN_MASK_RADIUS_RATIO: Final[float] = 0.45
+_CLAHE_CLIP_LIMIT: Final[float] = 2.0
+_CLAHE_TILE_SIZE: Final[int] = 8
 
 
 def extract_roi(image: Image.Image, tol: int = _DEFAULT_TOL, pad_ratio: float = 0.05) -> Image.Image:
@@ -79,83 +78,76 @@ def extract_roi(image: Image.Image, tol: int = _DEFAULT_TOL, pad_ratio: float = 
     return Image.fromarray(square)
 
 
-def ben_graham_scale(rgb: np.ndarray, target_radius: int = _BEN_TARGET_RADIUS) -> np.ndarray:
+def apply_ben_graham(
+    rgb: np.ndarray,
+    sigma_x: float = _BEN_SIGMA_X,
+    mask_radius_ratio: float = _BEN_MASK_RADIUS_RATIO,
+) -> np.ndarray:
     """
-    Sau ROI, scale ảnh sao cho bán kính ước lượng (nửa cạnh ngắn) ~ target_radius.
+    Ben Graham (Kaggle APTOS style): high-frequency emphasis.
+    output = 4*img - 4*GaussianBlur(img) + 128, với mask tròn để giảm artifact viền.
     """
-    h, w = rgb.shape[:2]
-    r_est = max(min(h, w) // 2, 1)
-    scale = target_radius / float(r_est)
-    new_w = max(1, int(round(w * scale)))
-    new_h = max(1, int(round(h * scale)))
-    return cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    blur = cv2.GaussianBlur(rgb, (0, 0), sigmaX=sigma_x)
+    ben = cv2.addWeighted(rgb, 4.0, blur, -4.0, 128.0)
+    h, w = ben.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    r = int(min(h, w) * mask_radius_ratio)
+    cx, cy = w // 2, h // 2
+    cv2.circle(mask, (cx, cy), max(r, 1), 255, -1)
+    mask_3 = cv2.merge([mask, mask, mask])
+    out = np.where(mask_3 > 0, ben, 128).astype(np.uint8)
+    return out
 
 
-def image_type_normalize(rgb: np.ndarray, bright_thresh: int = _IMGT_BRIGHT_THRESH) -> np.ndarray:
-    """
-    Phân nhóm theo tỷ lệ pixel gray > bright_thresh; chỉnh độ sáng nhẹ (linear).
-    """
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    frac = float(np.mean(gray > bright_thresh))
-    x = rgb.astype(np.float32)
-    if frac < 0.12:
-        x = np.clip(x * 1.10, 0, 255)
-    elif frac > 0.38:
-        x = np.clip(x * 0.95, 0, 255)
-    return x.astype(np.uint8)
+def apply_clahe_lab(
+    rgb: np.ndarray,
+    clip_limit: float = _CLAHE_CLIP_LIMIT,
+    tile_grid_size: int = _CLAHE_TILE_SIZE,
+) -> np.ndarray:
+    """CLAHE trên kênh L của không gian LAB (ảnh RGB uint8)."""
+    if rgb.dtype != np.uint8:
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(
+        clipLimit=clip_limit,
+        tileGridSize=(tile_grid_size, tile_grid_size),
+    )
+    l_eq = clahe.apply(l_ch)
+    lab_eq = cv2.merge([l_eq, a_ch, b_ch])
+    return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
 
 
 def preprocess_roi_only(image: Image.Image) -> Image.Image:
-    """Strategy 4: chỉ ROI."""
     return extract_roi(image)
 
 
 def preprocess_roi_ben(image: Image.Image) -> Image.Image:
-    """Strategy 2: ROI + Ben scale."""
     pil = extract_roi(image)
     arr = np.array(pil)
-    out = ben_graham_scale(arr)
+    out = apply_ben_graham(arr)
     return Image.fromarray(out)
 
 
-def preprocess_roi_imgtype(image: Image.Image) -> Image.Image:
-    """Strategy 3: ROI + image type norm."""
+def preprocess_roi_clahe(image: Image.Image) -> Image.Image:
     pil = extract_roi(image)
     arr = np.array(pil)
-    out = image_type_normalize(arr)
+    out = apply_clahe_lab(arr)
     return Image.fromarray(out)
 
 
-def preprocess_roi_ben_imgtype(image: Image.Image) -> Image.Image:
-    """Strategy 1: ROI + Ben + image type."""
+def preprocess_roi_ben_clahe(image: Image.Image) -> Image.Image:
+    """Thứ tự: ROI → Ben → CLAHE (theo tài liệu quy trình)."""
     pil = extract_roi(image)
     arr = np.array(pil)
-    arr = ben_graham_scale(arr)
-    arr = image_type_normalize(arr)
+    arr = apply_ben_graham(arr)
+    arr = apply_clahe_lab(arr)
     return Image.fromarray(arr)
 
-def preprocess_ben(image: Image.Image) -> Image.Image:
-    """Strategy 6: chỉ Ben."""
-    arr = np.array(image)
-    arr = ben_graham_scale(arr)
-    return Image.fromarray(arr)
-
-def preprocess_imgtype(image: Image.Image) -> Image.Image:
-    """Strategy 7: chỉ image type."""
-    arr = np.array(image)
-    out = image_type_normalize(arr)
-    return Image.fromarray(out)
-
-def preprocess_ben_imgtype(image: Image.Image) -> Image.Image:
-    """Strategy 8: Ben + image type."""
-    arr = np.array(image)
-    pil = ben_graham_scale(image)
-
-    out = image_type_normalize(arr)
-    return Image.fromarray(out)
 
 def preprocess_none(image: Image.Image) -> Image.Image:
-    """Không đổi (baseline trước resize)."""
     return image
 
 
@@ -163,11 +155,8 @@ _PREPROCESS_FUNCS: dict[str, Callable[[Image.Image], Image.Image]] = {
     STRATEGY_NONE: preprocess_none,
     STRATEGY_ROI: preprocess_roi_only,
     STRATEGY_ROI_BEN: preprocess_roi_ben,
-    STRATEGY_ROI_IMGT: preprocess_roi_imgtype,
-    STRATEGY_ROI_BEN_IMGT: preprocess_roi_ben_imgtype,
-    STRATEGY_BEN: preprocess_ben,
-    STRATEGY_IMGT: preprocess_imgtype,
-    STRATEGY_BEN_IMGT: preprocess_ben_imgtype,
+    STRATEGY_ROI_CLAHE: preprocess_roi_clahe,
+    STRATEGY_ROI_BEN_CLAHE: preprocess_roi_ben_clahe,
 }
 
 
