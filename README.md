@@ -29,10 +29,11 @@ fundus-disease-detection/
 └── src/
     ├── __init__.py
     ├── dataset.py              # Dataset, transforms, dataloaders
-    ├── models.py               # Factory tạo model (EfficientNet-B7 / Swin-Base)
-    ├── train.py                # Training loop với DDP + AMP
+    ├── models.py               # Factory tạo model + freeze strategy
+    ├── train.py                # Training loop với DDP + AMP + scheduler
     ├── evaluate.py             # Tính toán metrics
     ├── visualize.py            # Vẽ figures đánh giá
+    ├── xai.py                  # Explainability (GradCAM, v.v.)
     └── utils.py                # Checkpoint, submission CSV, zip outputs, W&B
 ```
 
@@ -40,10 +41,10 @@ fundus-disease-detection/
 
 ## Models
 
-| Model            | Backbone                           | Input   | Pretrained  |
-|------------------|------------------------------------|---------|-------------|
-| EfficientNet-B7  | `tf_efficientnet_b7` (timm)        | 456×456 | ImageNet-1k |
-| Swin Transformer | `swin_base_patch4_window7_224`     | 224×224 | ImageNet-1k |
+| Model            | Backbone                                          | Input   | Pretrained   |
+|------------------|---------------------------------------------------|---------|--------------|
+| EfficientNet-B7  | `tf_efficientnet_b7` (timm)                       | 456×456 | ImageNet-1k  |
+| SwinV2-Base      | `swinv2_base_window12to24_192to384_22kft1k` (timm)| 384×384 | ImageNet-22k |
 
 Pretrained weights tải tự động từ HuggingFace Hub qua `timm`.
 
@@ -62,7 +63,7 @@ pip install -r requirements.txt
 1. Upload toàn bộ repo lên Kaggle (dùng Kaggle Dataset hoặc GitHub integration)
 2. Thêm `WANDB_API_KEY` vào **Kaggle Secrets** (Add-ons → Secrets)
 3. Mở `notebooks/baseline.ipynb`
-4. Chỉnh thông số trong **Cell 2** (MODEL_TYPE, EPOCHS, BATCH_SIZE, ...)
+4. Chỉnh thông số trong **Cell 2** (xem bảng bên dưới)
 5. Run All
 
 ---
@@ -71,35 +72,72 @@ pip install -r requirements.txt
 
 ### Chiến lược học (Learning Strategy)
 
-Toàn bộ model được fine-tune end-to-end từ pretrained ImageNet weights — không đóng băng backbone. Bài toán được mô hình hóa là **ordinal regression**: model dự đoán 1 giá trị thực trong khoảng `[0, 4]`, sau đó làm tròn và clip về nhãn nguyên.
+Bài toán được mô hình hóa là **Ordinal Regression**: model dự đoán 1 giá trị thực trong khoảng `[0, 4]`, sau đó làm tròn và clip về nhãn nguyên.
 
 ```
-Pretrained backbone (ImageNet-1k)
-        ↓  fine-tune toàn bộ
+Pretrained backbone (ImageNet)
+        ↓  fine-tune với Differential LR
 Custom head: Linear(feat_dim → 1)
         ↓
 output: float ∈ [0, 4]  →  round().clip(0, 4)  →  label ∈ {0,1,2,3,4}
 ```
 
-### Thông số mặc định
+### Thông số mặc định (Cell 2 — notebook)
 
-| Thành phần       | Giá trị               | Ghi chú                                        |
-|------------------|-----------------------|------------------------------------------------|
-| Optimizer        | Adam                  | Không dùng weight decay                        |
-| Learning Rate    | `1e-4`                | Áp dụng đồng đều toàn bộ tham số               |
-| Epochs           | 15                    | Chỉnh `EPOCHS` trong Cell 2                    |
-| Loss function    | `SmoothL1Loss`        | Robust với outlier hơn MSE, phù hợp ordinal    |
-| Batch size       | 16 per GPU            | Effective batch = 16 × 2 GPU = 32              |
-| Mixed Precision  | AMP FP16              | `torch.amp.autocast("cuda")` + `GradScaler`    |
-| Parallelism      | DDP (NCCL)            | `mp.spawn` trên 2× T4, mỗi GPU 1 process       |
-| Best model       | Theo **val QWK**      | Lưu tại `outputs/checkpoints/`                 |
+| Thành phần        | EfficientNet-B7         | SwinV2-Base                         | Ghi chú |
+|-------------------|-------------------------|-------------------------------------|---------|
+| `MODEL_TYPE`      | `"efficientnet_b7"`     | `"swinv2_base_384"`                 | Chỉnh trong Cell 2 |
+| `IMAGE_SIZE`      | `456`                   | `384`                               | Phải khớp model |
+| `LR`              | `1e-4`                  | `2e-5` → `5e-5`                     | Head LR; backbone = LR × 0.1 |
+| `EPOCHS`          | `20`                    | `20`                                | |
+| `BATCH_SIZE`      | `8` / GPU               | `8` / GPU                           | Effective = 8 × số GPU |
+| `FREEZE_STRATEGY` | `"none"`                | `"none"` / `"partial"`              | Xem mục bên dưới |
+| `CLASS_WEIGHTS`   | auto-computed           | auto-computed                       | Tính từ phân phối APTOS |
+| `LR_FACTOR`       | `0.5`                   | —                                   | ReduceLROnPlateau |
+| `LR_PATIENCE`     | `3`                     | —                                   | ReduceLROnPlateau |
+| `WARMUP_EPOCHS`   | —                       | `2`                                 | Linear warmup cho SwinV2 |
+| `T_0`             | —                       | `None` (= EPOCHS − WARMUP_EPOCHS)   | Chu kỳ Cosine |
+| `USE_AMP`         | `True`                  | `True`                              | Mixed Precision FP16 |
 
-### Thông số theo từng model
+### Optimizer — AdamW + Differential Learning Rate
 
-| Model            | Input size | Params  | Batch/GPU | VRAM ước tính |
-|------------------|------------|---------|-----------|---------------|
-| EfficientNet-B7  | 456×456    | ~66M    | 8        | ~12 GB        |
-| Swin-Base        | 224×224    | ~88M    | 8        | ~10 GB        |
+Học riêng biệt cho backbone và head để bảo toàn pretrained weights:
+
+```
+backbone params  →  lr = LR × 0.1   (nhỏ hơn 10×)
+head params      →  lr = LR
+weight_decay     →  1e-5 (EfficientNet)  |  0.05 (SwinV2, bắt buộc để tránh overfit)
+```
+
+### Loss Function — WeightedSmoothL1Loss
+
+Custom loss xử lý mất cân bằng nhãn trong APTOS 2019:
+
+```python
+# Phân phối APTOS 2019: Class 0 chiếm ~49%, Class 3 chỉ ~5%
+_class_counts = [1805, 370, 999, 193, 295]
+CLASS_WEIGHTS = [n_samples / (n_classes × count) for count in _class_counts]
+# ≈ [0.40, 1.97, 0.73, 3.80, 2.48]
+```
+
+- Loss = `smooth_l1(pred, target, reduction='none') × weight[target_class]`
+- Nhãn hiếm (class 3, 4) có weight cao → model bị phạt nặng hơn → kéo per-class recall và QWK lên
+- Nếu không truyền `CLASS_WEIGHTS` vào CFG → fallback về `SmoothL1Loss` thuần tuý
+
+### Scheduler theo kiến trúc
+
+| Kiến trúc        | Scheduler                                             | Lý do |
+|------------------|-------------------------------------------------------|-------|
+| EfficientNet (CNN)| `ReduceLROnPlateau(mode="max", patience=3)`           | Theo dõi `val_qwk` trực tiếp, an toàn, không cần warmup |
+| SwinV2 (Transformer)| `LinearLR (warmup) → CosineAnnealingWarmRestarts`  | Transformer cần warmup từ LR×0.01→LR để ổn định attention |
+
+### Freeze Strategy (`FREEZE_STRATEGY`)
+
+| Giá trị     | Hành vi                                                  | Dùng khi                    |
+|-------------|----------------------------------------------------------|-----------------------------|
+| `"none"`    | Train toàn bộ network (end-to-end)                       | Mặc định, có đủ dữ liệu     |
+| `"head_only"` | Đóng băng backbone, chỉ train classifier head          | Linear Probing, dữ liệu ít  |
+| `"partial"` | Unfreeze block/stage cuối + head; đóng băng phần còn lại | Fine-tune tiết kiệm VRAM    |
 
 ### Preprocessing
 
@@ -113,24 +151,26 @@ transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
 ### Metrics đánh giá
 
-| Metric              | Mô tả                                              |
-|---------------------|----------------------------------------------------|
-| **QWK** (primary)   | Quadratic Weighted Kappa — metric chính của Kaggle |
-| Accuracy            | Tỉ lệ dự đoán đúng                                 |
-| Macro F1            | F1 trung bình đồng đều giữa các lớp               |
-| Balanced Accuracy   | Accuracy có tính mất cân bằng lớp                 |
-| Per-class Recall    | Recall riêng từng lớp 0–4                          |
-| Confusion Matrix    | Ma trận nhầm lẫn (normalized theo hàng)            |
-| Classification Report | Precision / Recall / F1 chi tiết mỗi lớp        |
-| Train / Val Loss    | SmoothL1 loss theo từng epoch                      |
+| Metric                | Mô tả                                              |
+|-----------------------|----------------------------------------------------|
+| **QWK** (primary)     | Quadratic Weighted Kappa — metric chính của Kaggle |
+| Accuracy              | Tỉ lệ dự đoán đúng                                 |
+| Macro F1              | F1 trung bình đồng đều giữa các lớp               |
+| Balanced Accuracy     | Accuracy có tính mất cân bằng lớp                 |
+| Per-class Recall      | Recall riêng từng lớp 0–4                          |
+| Confusion Matrix      | Ma trận nhầm lẫn (normalized theo hàng)            |
+| Classification Report | Precision / Recall / F1 chi tiết mỗi lớp          |
+| Train / Val Loss      | WeightedSmoothL1 loss theo từng epoch              |
+| `lr/head` & `lr/backbone` | Learning rate thực tế mỗi epoch (W&B)        |
 
 ### Lưu ý khi thay đổi thông số
 
-- **Đổi model**: thay `MODEL_TYPE` và `IMAGE_SIZE` trong Cell 2 cùng lúc
-  - `"efficientnet_b7"` → `IMAGE_SIZE = 456`
-  - `"swin_transformer"` → `IMAGE_SIZE = 224`
-- **Tăng batch size**: kiểm tra VRAM; nếu OOM thì giảm xuống 8 hoặc dùng `gradient_accumulation`
-- **Tăng epochs**: chỉnh `EPOCHS`; model sẽ tự lưu checkpoint tốt nhất theo val QWK
+- **Đổi model**: thay `MODEL_TYPE` và `IMAGE_SIZE` đồng thời
+  - `"efficientnet_b7"` → `IMAGE_SIZE = 456`, `LR = 1e-4`
+  - `"swinv2_base_384"` → `IMAGE_SIZE = 384`, `LR = 2e-5`
+- **CLASS_WEIGHTS**: tính tự động từ `_class_counts` trong Cell 2; cập nhật nếu dùng dataset khác
+- **Tăng batch size**: kiểm tra VRAM; nếu OOM thì giảm xuống 4
+- **Tăng epochs**: chỉnh `EPOCHS`; model tự lưu checkpoint tốt nhất theo val QWK
 
 ---
 
@@ -157,8 +197,8 @@ outputs/
 │   ├── training_curves.png
 │   └── per_class_recall.png
 ├── submission.csv              # Submit lên Kaggle
-├── evaluation_metrics.txt      # Bản đầy đủ: loss, QWK, F1, recall, sklearn report
-├── classification_report.txt   # Giống nội dung evaluation_metrics.txt
+├── evaluation_metrics.txt      # loss, QWK, F1, recall, sklearn report
+├── classification_report.txt
 ├── wandb_run_meta.json         # id run W&B — dùng resume sau training
 ├── pipeline_full_console.log   # Toàn bộ stdout/stderr notebook + log DDP rank 0
 └── outputs.zip                 # Tất cả được zip tự động
@@ -168,26 +208,27 @@ outputs/
 
 ## Experiment Tracking (Weights & Biases)
 
-Dùng [Weights & Biases](https://wandb.ai) cho **toàn bộ pipeline** (không dừng sau epoch cuối):
+Dùng [Weights & Biases](https://wandb.ai) cho **toàn bộ pipeline**:
 
-1. **Training (DDP)**: mỗi epoch — train/val loss, acc, QWK, thời gian epoch; cuối training log `pipeline/stage=training_complete`, lưu `wandb_run_meta.json`, rồi `wandb.finish()` ở worker.
-2. **Notebook resume**: Cell 6–8 gọi `resume_wandb_run()` với cùng `run id` để tiếp tục log:
+1. **Training (DDP)**: mỗi epoch log `train/loss`, `val/loss`, `train/qwk`, `val/qwk`, **`lr/head`**, **`lr/backbone`**, `epoch_time_s`; cuối training log `pipeline/stage=training_complete`, lưu `wandb_run_meta.json`.
+2. **Notebook resume** (Cell 6–8): tiếp tục cùng run id để log:
    - **Eval (held-out 10%)**: scalar metrics, bảng classification report (HTML), artifact `evaluation_metrics`.
    - **Submission**: phân phối nhãn trên `test.csv`, artifact `submission_csv`.
-   - **Figures + outputs**: ảnh confusion matrix / curves / recall, artifact `pipeline_outputs` (cả thư mục `outputs/`), artifact `outputs_zip`; cuối cùng `wandb_finish_pipeline()` đóng run.
-
-File `evaluation_metrics.txt` trùng format với log console (Validation Loss, QWK, Accuracy, Macro F1, Balanced Accuracy, Per-class Recall, classification report sklearn).
+   - **Figures + outputs**: confusion matrix / curves / recall, artifact `pipeline_outputs`, artifact `outputs_zip`.
 
 ### Log console đầy đủ (`pipeline_full_console.log`)
 
-- **Cell 2** gọi `start_pipeline_console_capture(OUTPUT_DIR)` — mọi `print` / stderr của notebook (Cell 2→8) được **tee** vào `pipeline_full_console.log`.
-- **DDP**: tiến trình worker không dùng chung `sys.stdout` với notebook — `train.py` (rank 0) **append** từng dòng epoch, best model, kết thúc training vào cùng file.
-- **Cell 8** (sau phần in tóm tắt): `stop_pipeline_console_capture()` đóng file, rồi W&B upload artifact `pipeline_console_log` + preview HTML `pipeline/full_console_preview` (tối đa ~120k ký tự; bản đầy đủ trong artifact).
+- **Cell 2** gọi `start_pipeline_console_capture(OUTPUT_DIR)` — mọi `print` / stderr của notebook được **tee** vào file.
+- **DDP**: rank 0 trong `train.py` **append** từng dòng epoch, best model, kết thúc training vào cùng file.
+- **Cell 8**: `stop_pipeline_console_capture()` đóng file, W&B upload artifact `pipeline_console_log`.
 
 ---
 
 ## Yêu cầu phần cứng
 
-- 2× NVIDIA T4 GPU (Kaggle)
-- CUDA 11.x hoặc mới hơn
-- RAM ≥ 16GB
+| Thành phần | Yêu cầu                    |
+|------------|----------------------------|
+| GPU        | 2× NVIDIA T4 (Kaggle)      |
+| VRAM       | ~12 GB / GPU (B7), ~14 GB / GPU (SwinV2-384) |
+| CUDA       | 11.x hoặc mới hơn          |
+| RAM        | ≥ 16 GB                    |
