@@ -32,6 +32,8 @@ def process_image(img_path: str, out_dir: str, strategy: str) -> tuple[bool, str
 
         # Lưu PNG với compress_level=1 (nhanh hơn mặc định=6, file lớn hơn chút)
         img_processed.save(out_path, format="PNG", compress_level=1)
+        del img
+        del img_processed
         return True, img_path
 
     except Exception as e:
