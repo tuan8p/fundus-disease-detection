@@ -4,101 +4,152 @@ from glob import glob
 from PIL import Image
 from tqdm import tqdm
 from functools import partial
-import multiprocessing as mp
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Đưa src vào hệ thống để import thư viện của bạn
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.preprocessing import apply_preprocessing, list_strategies, validate_strategy
 
-def process_image(img_path, out_dir, strategy):
+# PIL tăng giới hạn ảnh lớn
+Image.MAX_IMAGE_PIXELS = None
+
+
+def process_image(img_path: str, out_dir: str, strategy: str) -> tuple[bool, str]:
     """
-    Hàm xử lý một ảnh: đọc ảnh, chạy tiền xử lý và lưu xuống ổ cứng.
+    Xử lý một ảnh: đọc → preprocess → lưu.
+    Trả về (success, img_path) để dễ track lỗi.
     """
     try:
-        # Giữ nguyên tên file (VD: id_code.png)
         img_name = os.path.basename(img_path)
         out_path = os.path.join(out_dir, img_name)
-        
-        # Nếu file đã tồn tại thì bỏ qua (hỗ trợ resume nếu bị ngắt ngang)
+
         if os.path.exists(out_path):
-            return True
-            
+            return True, img_path
+
         img = Image.open(img_path).convert("RGB")
         img_processed = apply_preprocessing(img, strategy)
-        img_processed.save(out_path, format="PNG")
-        return True
+
+        # Lưu PNG với compress_level=1 (nhanh hơn mặc định=6, file lớn hơn chút)
+        img_processed.save(out_path, format="PNG", compress_level=1)
+        return True, img_path
+
     except Exception as e:
-        print(f"\nLỗi khi xử lý ảnh {img_path}: {e}")
-        return False
+        return False, f"{img_path} — Lỗi: {e}"
+
+
+def process_batch(
+    image_paths: list[str],
+    out_dir: str,
+    strategy: str,
+    num_workers: int,
+    split_name: str,
+) -> int:
+    """
+    Xử lý một batch ảnh bằng ThreadPoolExecutor.
+    Trả về số ảnh lỗi.
+    """
+    if not image_paths:
+        return 0
+
+    print(f"\nĐang xử lý [{split_name}] — {len(image_paths)} ảnh, {num_workers} threads...")
+
+    errors = 0
+    fn = partial(process_image, out_dir=out_dir, strategy=strategy)
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(fn, p): p for p in image_paths}
+
+        with tqdm(total=len(futures), unit="img", dynamic_ncols=True) as pbar:
+            for future in as_completed(futures):
+                success, info = future.result()
+                if not success:
+                    errors += 1
+                    tqdm.write(f"  ✗ {info}")
+                pbar.update(1)
+
+    return errors
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Script tiền xử lý toàn bộ dataset APTOS 2019 offline")
-    parser.add_argument("--data_dir", type=str, required=True, 
-                        help="Đường dẫn đến dataset gốc (chứa train.csv, train_images/, test_images/)")
-    parser.add_argument("--output_dir", type=str, required=True, 
-                        help="Đường dẫn lưu dataset sau khi xử lý (ví dụ: data/aptos_roi_ben_clahe/)")
-    parser.add_argument("--strategy", type=str, required=True, 
-                        help=f"Chiến lược xử lý (các lựa chọn: {list_strategies()})")
-    parser.add_argument("--num_workers", type=int, default=os.cpu_count(), 
-                        help="Số luồng CPU/Worker để tăng tốc độ chạy (mặc định lấy tối đa CPU)")
-    
+    parser = argparse.ArgumentParser(
+        description="Tiền xử lý offline dataset APTOS 2019 — tối ưu cho Kaggle CPU"
+    )
+    parser.add_argument("--data_dir", type=str, required=True,
+                        help="Dataset gốc (chứa train.csv, train_images/, test_images/)")
+    parser.add_argument("--output_dir", type=str, required=True,
+                        help="Thư mục lưu dataset sau xử lý")
+    parser.add_argument("--strategy", type=str, required=True,
+                        help=f"Strategy xử lý. Chọn: {list_strategies()}")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="Số threads (mặc định 4 — phù hợp Kaggle 2-core CPU)")
+    parser.add_argument("--splits", type=str, default="train,test",
+                        help="Splits cần xử lý, cách nhau bởi dấu phẩy (mặc định: train,test)")
+
     args = parser.parse_args()
-    
-    # Kiểm tra tính hợp lệ của strategy
     validate_strategy(args.strategy)
-    if args.strategy == "none":
-        print("Cảnh báo: Strategy là 'none', script sẽ chỉ copy ảnh gốc mà không qua xử lý gì.")
-    
-    # 1. Tạo câu trúc thư mục output
-    train_out = os.path.join(args.output_dir, "train_images")
-    test_out = os.path.join(args.output_dir, "test_images")
-    os.makedirs(train_out, exist_ok=True)
-    os.makedirs(test_out, exist_ok=True)
-    
-    # 2. Copy luôn các file csv qua output_dir để thư mục output có thể thay thế thẳng cho data_dir cũ
+
+    splits = [s.strip() for s in args.splits.split(",")]
+
+    # ── Tạo thư mục output ───────────────────────────────────────────────
+    split_dirs = {}
+    for split in splits:
+        d = os.path.join(args.output_dir, f"{split}_images")
+        os.makedirs(d, exist_ok=True)
+        split_dirs[split] = d
+
+    # ── Copy CSV ─────────────────────────────────────────────────────────
     for csv_file in ["train.csv", "test.csv", "sample_submission.csv"]:
-        src_csv = os.path.join(args.data_dir, csv_file)
-        if os.path.exists(src_csv):
-            shutil.copy(src_csv, os.path.join(args.output_dir, csv_file))
-            
-    # 3. Thu thập danh sách ảnh
-    train_images = glob(os.path.join(args.data_dir, "train_images", "*.png"))
-    test_images = glob(os.path.join(args.data_dir, "test_images", "*.png"))
-    
+        src = os.path.join(args.data_dir, csv_file)
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(args.output_dir, csv_file))
+
+    # ── Thu thập ảnh ─────────────────────────────────────────────────────
+    split_images = {}
+    for split in splits:
+        paths = glob(os.path.join(args.data_dir, f"{split}_images", "*.png"))
+        split_images[split] = paths
+
+    # ── Header ───────────────────────────────────────────────────────────
+    total_imgs = sum(len(v) for v in split_images.values())
     print("=" * 60)
-    print(" BẮT ĐẦU TIỀN XỬ LÝ OFFLINE ")
+    print("  TIỀN XỬ LÝ OFFLINE — APTOS 2019")
     print("=" * 60)
-    print(f"Strategy   : {args.strategy}")
-    print(f"Workers    : {args.num_workers}")
-    print(f"Nguồn      : {args.data_dir}")
-    print(f"Đích       : {args.output_dir}")
-    print(f"Train. imgs: {len(train_images)}")
-    print(f"Test. imgs : {len(test_images)}")
+    print(f"  Strategy  : {args.strategy}")
+    print(f"  Workers   : {args.num_workers} threads")
+    print(f"  Nguồn     : {args.data_dir}")
+    print(f"  Đích      : {args.output_dir}")
+    for split in splits:
+        print(f"  {split:8s}  : {len(split_images[split])} ảnh")
+    print(f"  Tổng      : {total_imgs} ảnh")
     print("-" * 60)
-    
-    # 4. Xử lý đa luồng (Multiprocessing) để tận dụng hết CPU
-    if train_images:
-        print("\nĐang xử lý [train_images]...")
-        process_train = partial(process_image, out_dir=train_out, strategy=args.strategy)
-        with mp.Pool(args.num_workers) as pool:
-            # dùng tqdm để hiển thị thanh tiến trình
-            list(tqdm(pool.imap(process_train, train_images), total=len(train_images)))
-            
-    if test_images:
-        print("\nĐang xử lý [test_images]...")
-        process_test = partial(process_image, out_dir=test_out, strategy=args.strategy)
-        with mp.Pool(args.num_workers) as pool:
-            list(tqdm(pool.imap(process_test, test_images), total=len(test_images)))
-            
+
+    if args.strategy == "none":
+        print("⚠  Strategy 'none': chỉ copy ảnh, không xử lý.")
+
+    # ── Xử lý từng split ────────────────────────────────────────────────
+    total_errors = 0
+    for split in splits:
+        errors = process_batch(
+            image_paths=split_images[split],
+            out_dir=split_dirs[split],
+            strategy=args.strategy,
+            num_workers=args.num_workers,
+            split_name=f"{split}_images",
+        )
+        total_errors += errors
+
+    # ── Footer ───────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print(f"HOÀN TẤT! Dataset mới đã được lưu tại: {os.path.abspath(args.output_dir)}")
+    if total_errors == 0:
+        print(f"✓ HOÀN TẤT! Lưu tại: {os.path.abspath(args.output_dir)}")
+    else:
+        print(f"⚠ HOÀN TẤT với {total_errors} lỗi. Kiểm tra log phía trên.")
     print("=" * 60)
-    print("HƯỚNG DẪN SỬ DỤNG CHO TRAINING:")
-    print(" 1. Mở file configs hoặc notebook (vd: baseline.ipynb)")
-    print(f" 2. Đổi DATA_DIR = '{os.path.abspath(args.output_dir)}'")
-    print(" 3. Nhớ đổi PREPROCESSING_STRATEGY = 'none' (vì ảnh đã được xử lý sẵn)")
+    print("BƯỚC TIẾP THEO:")
+    print(f"  DATA_DIR = '{os.path.abspath(args.output_dir)}'")
+    print("  PREPROCESSING_STRATEGY = 'none'  (ảnh đã xử lý sẵn)")
+
 
 if __name__ == "__main__":
     main()
