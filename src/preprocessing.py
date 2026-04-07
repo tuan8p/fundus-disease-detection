@@ -30,13 +30,13 @@ from PIL import Image
 STRATEGY_NONE: Final[str] = "none"
 STRATEGY_BEN: Final[str] = "ben"
 STRATEGY_CLAHE: Final[str] = "clahe"
-STRATEGY_BEN_CLAHE: Final[str] = "ben_clahe"
+STRATEGY_ROI: Final[str] = "roi"
 
 ALL_STRATEGIES: tuple[str, ...] = (
     STRATEGY_NONE,
     STRATEGY_BEN,
     STRATEGY_CLAHE,
-    STRATEGY_BEN_CLAHE,
+    STRATEGY_ROI,
 )
 
 _BEN_MASK_RADIUS_RATIO: Final[float] = 0.48   # tăng từ 0.45 → giảm halo viền
@@ -47,20 +47,10 @@ _CLAHE_CLIP_LIMIT: Final[float] = 2.0          # tăng từ 1.0 → contrast t�
 # Core transforms
 # ---------------------------------------------------------------------------
 
-def apply_ben_graham(
-    rgb: np.ndarray,
-    sigma_x: float | None = None,
-    mask_radius_ratio: float = _BEN_MASK_RADIUS_RATIO,
-) -> np.ndarray:
+def apply_ben_graham(rgb: np.ndarray, sigma_x: float | None = None) -> np.ndarray:
     """
-    Ben Graham (Kaggle APTOS style): high-frequency emphasis.
-    output = 4*img - 4*GaussianBlur(img) + 128, với circular mask để giảm artifact viền.
-
-    Thay đổi:
-      - sigma_x tự tính: short_side * 0.04, clamp [20, 80]  (cũ: 0.02, [10, 60])
-        → blur mạnh hơn → loại noise tốt hơn trước khi subtract
-      - mask_radius_ratio: 0.48  (cũ: 0.45)
-        → bao phủ fundus rộng hơn, giảm viền xám lộ ra
+    Ben Graham chuẩn y khoa: Không dùng vòng tròn cứng.
+    Dùng mặt nạ động (Dynamic Mask) để giữ nguyên vẹn hình dáng võng mạc thật.
     """
     if sigma_x is None:
         short_side = min(rgb.shape[0], rgb.shape[1])
@@ -69,39 +59,45 @@ def apply_ben_graham(
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
-    blur = cv2.GaussianBlur(rgb, (0, 0), sigmaX=sigma_x)
-    ben = cv2.addWeighted(rgb, 4.0, blur, -4.0, 128.0)
+    # 1. Tạo mặt nạ động dựa trên điểm ảnh thực (loại bỏ padding đen)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    mask = gray > 7  # Ngưỡng giống với extract_roi
+    mask_3 = np.stack([mask, mask, mask], axis=-1)
 
-    h, w = ben.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    r = int(min(h, w) * mask_radius_ratio)
-    cx, cy = w // 2, h // 2
-    cv2.circle(mask, (cx, cy), max(r, 1), 255, -1)
-    mask_3 = cv2.merge([mask, mask, mask])
+    # 2. Pre-fill nền thành 128 TRƯỚC khi Blur để tránh halo artifact viền
+    #    Vấn đề: GaussianBlur pha trộn pixel viền sáng (200) với nền đen (0)
+    #    → blur ≈ 100 → ben = 4×200 - 4×100 + 128 = 528 → viền trắng chói
+    #    Fix: nếu nền = 128 → blur ≈ (200+128)/2 = 164 → ben ≈ 128 → trung tính
+    rgb_filled = np.where(mask_3, rgb, 128).astype(np.uint8)
 
-    return np.where(mask_3 > 0, ben, 128).astype(np.uint8)
+    # 3. Áp dụng công thức Ben Graham trên ảnh đã fill nền
+    blur = cv2.GaussianBlur(rgb_filled, (0, 0), sigmaX=sigma_x)
+    ben = cv2.addWeighted(rgb_filled, 4.0, blur, -4.0, 128.0)
 
+    # 4. Phủ lại nền xám (128) cho phần ngoài võng mạc (đảm bảo sạch hoàn toàn)
+    return np.where(mask_3, ben, 128).astype(np.uint8)
 
 def apply_clahe_lab(
     rgb: np.ndarray,
-    clip_limit: float = _CLAHE_CLIP_LIMIT,
+    clip_limit: float = 2.0,
     tile_grid_size: int | None = None,
 ) -> np.ndarray:
     """
-    CLAHE trên kênh L của không gian LAB (ảnh RGB uint8).
-
-    Thay đổi:
-      - clip_limit mặc định: 2.0  (cũ: 1.0)
-        → tăng contrast hiệu quả hơn, ít artifact hơn khi kết hợp với Ben
-      - tile_grid_size tự tính: short_side // 8, clamp [8, 32]  (giữ nguyên)
+    CLAHE trên kênh L. Bắt buộc phải xóa sạch artifact ở viền padding đen sau khi chạy.
     """
     if rgb.dtype != np.uint8:
         rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+
+    # 1. Tạo mặt nạ động để ghi nhớ vị trí viền đen
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    mask = gray > 7
+    mask_3 = np.stack([mask, mask, mask], axis=-1)
 
     if tile_grid_size is None:
         short_side = min(rgb.shape[0], rgb.shape[1])
         tile_grid_size = int(np.clip(short_side // 8, 8, 32))
 
+    # 2. Áp dụng CLAHE
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
     clahe = cv2.createCLAHE(
@@ -110,9 +106,54 @@ def apply_clahe_lab(
     )
     l_eq = clahe.apply(l_ch)
     lab_eq = cv2.merge([l_eq, a_ch, b_ch])
-    return cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
+    clahe_rgb = cv2.cvtColor(lab_eq, cv2.COLOR_LAB2RGB)
 
+    # 3. Ép vùng background về màu đen tuyệt đối (0) để xóa artifact
+    return np.where(mask_3, clahe_rgb, 0).astype(np.uint8)
 
+def extract_roi(image: Image.Image, tol: int = 7, pad_ratio: float = 0.05) -> Image.Image:
+    """
+    Cắt vùng fundus (chỉ lấy khối sáng lớn nhất), bỏ viền đen, 
+    pad nhẹ rồi căn vuông (letterbox đen).
+    """
+    arr = np.array(image.convert("RGB"))
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    
+    # 1. Tạo mask cơ bản
+    _, mask = cv2.threshold(gray, tol, 255, cv2.THRESH_BINARY)
+    
+    # 2. Tìm các contour (đường viền) trong mask
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # Nếu ảnh đen thui hoặc lỗi, trả về ảnh gốc
+    if not contours:
+        return image
+        
+    # 3. LỌC NHIỄU CHÍ MẠNG: Chỉ lấy Contour có diện tích lớn nhất (nhãn cầu)
+    largest_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    
+    # 4. Thêm padding để không cắt phạm rìa võng mạc (logic của bạn, rất tốt)
+    pad_y = max(1, int(h * pad_ratio))
+    pad_x = max(1, int(w * pad_ratio))
+    
+    y0 = max(0, y - pad_y)
+    x0 = max(0, x - pad_x)
+    y1 = min(arr.shape[0], y + h + pad_y)
+    x1 = min(arr.shape[1], x + w + pad_x)
+    
+    cropped = arr[y0:y1, x0:x1].copy()
+    
+    # 5. Ép về hình vuông 1:1 (Pad-to-square)
+    ch, cw = cropped.shape[0], cropped.shape[1]
+    side = max(ch, cw)
+    square = np.zeros((side, side, 3), dtype=np.uint8)
+    
+    y_off = (side - ch) // 2
+    x_off = (side - cw) // 2
+    square[y_off : y_off + ch, x_off : x_off + cw] = cropped
+    
+    return Image.fromarray(square)
 # ---------------------------------------------------------------------------
 # Strategy functions
 # ---------------------------------------------------------------------------
@@ -122,23 +163,21 @@ def preprocess_none(image: Image.Image) -> Image.Image:
 
 
 def preprocess_ben(image: Image.Image) -> Image.Image:
-    arr = np.array(image.convert("RGB"))
+    # Cắt gọt vuông vức trước -> Rồi mới đưa vào Ben Graham
+    cropped_img = extract_roi(image)
+    arr = np.array(cropped_img.convert("RGB"))
     out = apply_ben_graham(arr)
     return Image.fromarray(out)
 
-
 def preprocess_clahe(image: Image.Image) -> Image.Image:
-    arr = np.array(image.convert("RGB"))
+    # Cắt gọt vuông vức trước -> Rồi mới đưa vào CLAHE
+    cropped_img = extract_roi(image)
+    arr = np.array(cropped_img.convert("RGB"))
     out = apply_clahe_lab(arr)
     return Image.fromarray(out)
 
-
-def preprocess_ben_clahe(image: Image.Image) -> Image.Image:
-    """Thứ tự: Ben Graham → CLAHE (theo tài liệu quy trình)."""
-    arr = np.array(image.convert("RGB"))
-    arr = apply_ben_graham(arr)
-    arr = apply_clahe_lab(arr)
-    return Image.fromarray(arr)
+def preprocess_roi(image: Image.Image) -> Image.Image:
+    return extract_roi(image)
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +188,7 @@ _PREPROCESS_FUNCS: dict[str, Callable[[Image.Image], Image.Image]] = {
     STRATEGY_NONE: preprocess_none,
     STRATEGY_BEN: preprocess_ben,
     STRATEGY_CLAHE: preprocess_clahe,
-    STRATEGY_BEN_CLAHE: preprocess_ben_clahe,
+    STRATEGY_ROI: preprocess_roi,
 }
 
 

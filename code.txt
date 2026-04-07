@@ -2,3 +2,23 @@ python3 scripts/preprocess_offline.py \
     --data_dir "/home/minhtriet/Downloads/aptos2019-blindness-detection" \
     --output_dir "/home/minhtriet/Documents/fundus-disease-detection/aptos_ben_clahe" \
     --strategy "ben_clahe"
+
+
+python3 scripts/preprocess_offline.py \
+  --data_dir "/home/minhtriet/Downloads/aptos2019-blindness-detection" \
+  --output_dir "/home/minhtriet/Documents/fundus-disease-detection/aptos_roi" \
+  --strategy "roi" \
+  --num_workers 12
+
+python3 scripts/preprocess_offline.py \
+  --data_dir "/home/minhtriet/Downloads/aptos2019-blindness-detection" \
+  --output_dir "/home/minhtriet/Documents/fundus-disease-detection/aptos_clahe" \
+  --strategy "clahe" \
+  --num_workers 12
+
+
+python3 scripts/preprocess_offline.py \
+  --data_dir "/home/minhtriet/Downloads/aptos2019-blindness-detection" \
+  --output_dir "/home/minhtriet/Documents/fundus-disease-detection/aptos_ben" \
+  --strategy "ben" \
+  --num_workers 12  
