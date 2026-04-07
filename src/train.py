@@ -16,9 +16,16 @@ import time
 import warnings
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim.lr_scheduler import (
+    CosineAnnealingWarmRestarts,
+    ReduceLROnPlateau,
+    LinearLR,
+    SequentialLR,
+)
 from tqdm import tqdm
 
 # Dùng torch.amp thay vì torch.cuda.amp (tránh DeprecationWarning từ PyTorch 2.4+)
@@ -28,6 +35,45 @@ from .dataset import get_dataloaders
 from .models import build_model, predict_labels
 from .evaluate import compute_qwk
 from .utils import save_checkpoint, setup_wandb, save_wandb_run_meta, append_pipeline_log_line
+
+
+# ── Custom Loss ───────────────────────────────────────────────────────────────
+
+class WeightedSmoothL1Loss(nn.Module):
+    """
+    Smooth L1 Loss có trọng số theo class — giải quyết mất cân bằng nhãn
+    trong Ordinal Regression.
+
+    Cơ chế:
+      - Loss cơ bản (SmoothL1, không reduce) được nhân với trọng số tương
+        ứng nhãn thật của từng sample.
+      - Nhãn hiếm (e.g., class 3, 4) có weight cao → model bị phạt nặng hơn
+        khi đoán sai, kéo per-class recall và QWK lên.
+
+    Args:
+        class_weights (list[float]): 5 trọng số cho class 0 → 4.
+            Nên tính bằng: n_samples / (n_classes × n_samples_in_class)
+        beta (float): Ngưỡng chuyển giữa L1 và L2 trong Smooth L1. Default = 1.0
+    """
+
+    def __init__(self, class_weights: list, beta: float = 1.0):
+        super().__init__()
+        # register_buffer → tensor tự động đẩy lên GPU cùng model.to(device)
+        self.register_buffer(
+            "class_weights",
+            torch.tensor(class_weights, dtype=torch.float32),
+        )
+        self.beta = beta
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Smooth L1 reduction='none' → shape [B]
+        loss = F.smooth_l1_loss(preds, targets, reduction="none", beta=self.beta)
+
+        # targets là float, cần đổi sang long để làm index vào class_weights
+        target_indices = torch.round(targets).long().clamp(0, 4)
+        weights = self.class_weights[target_indices]  # shape [B]
+
+        return (loss * weights).mean()
 
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
@@ -182,13 +228,86 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    model = build_model(cfg["MODEL_TYPE"]).to(device)
+    freeze_strategy = cfg.get("FREEZE_STRATEGY", "none")
+    model = build_model(
+        cfg["MODEL_TYPE"], freeze_strategy=freeze_strategy
+    ).to(device)
     model = DDP(model, device_ids=[rank], output_device=rank)
 
-    # ── Optimizer & Loss ──────────────────────────────────────────────────────
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["LR"])
-    criterion = nn.SmoothL1Loss()
-    scaler    = GradScaler("cuda", enabled=cfg.get("USE_AMP", True))
+    model_type: str = cfg["MODEL_TYPE"]
+    is_transformer = "swin" in model_type  # phân biệt CNN vs Transformer
+
+    # ── Optimizer & Differential Learning Rate ────────────────────────────────
+    # Tách head và backbone để đặt LR khác nhau (differential LR)
+    head_params   = list(model.module.backbone.get_classifier().parameters())
+    head_param_ids = {id(p) for p in head_params}
+    base_params   = [
+        p for p in model.module.parameters()
+        if id(p) not in head_param_ids and p.requires_grad
+    ]
+
+    # Transformer cần weight_decay lớn hơn CNN để chống overfit
+    wd = 0.05 if is_transformer else 1e-5
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": base_params, "lr": cfg["LR"] * 0.1},  # backbone: LR nhỏ hơn 10×
+            {"params": head_params,  "lr": cfg["LR"]},         # head: LR đầy đủ
+        ],
+        weight_decay=wd,
+    )
+
+    # ── Loss (Criterion) ──────────────────────────────────────────────────────
+    # Dùng WeightedSmoothL1Loss nếu class_weights được truyền vào, ngược lại
+    # fallback về SmoothL1Loss thuần tuý.
+    raw_cw = cfg.get("CLASS_WEIGHTS", None)
+    if raw_cw is not None:
+        criterion = WeightedSmoothL1Loss(class_weights=raw_cw).to(device)
+        if rank == 0:
+            print(f"[Loss] WeightedSmoothL1Loss | class_weights = {raw_cw}")
+    else:
+        criterion = nn.SmoothL1Loss()
+        if rank == 0:
+            print("[Loss] SmoothL1Loss (không có class_weights)")
+
+    # ── Scheduler ─────────────────────────────────────────────────────────────
+    # EfficientNet (CNN): ReduceLROnPlateau — an toàn, theo dõi val_qwk trực tiếp.
+    # SwinV2 (Transformer): Linear Warmup (2 epoch) → CosineAnnealingWarmRestarts.
+    if is_transformer:
+        warmup_epochs = cfg.get("WARMUP_EPOCHS", 2)
+        T_0 = cfg.get("T_0", max(cfg["EPOCHS"] - warmup_epochs, 1))
+        # Warmup: LR tăng tuyến tính từ LR×0.01 → LR trong warmup_epochs epoch
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=warmup_epochs,
+        )
+        # Cosine: sau warmup, decay hình cosine và restart
+        cosine_scheduler = CosineAnnealingWarmRestarts(
+            optimizer, T_0=T_0, T_mult=1, eta_min=1e-7
+        )
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs],
+        )
+        scheduler_type = "LinearWarmup+CosineAnnealingWarmRestarts"
+    else:
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="max",          # tối đa hoá val_qwk
+            factor=cfg.get("LR_FACTOR", 0.5),
+            patience=cfg.get("LR_PATIENCE", 3),
+            min_lr=1e-7,
+        )
+        scheduler_type = "ReduceLROnPlateau"
+
+    if rank == 0:
+        print(f"[Scheduler] {scheduler_type}")
+        print(f"[Optimizer] AdamW | backbone_lr={cfg['LR'] * 0.1:.2e}  head_lr={cfg['LR']:.2e}  wd={wd}")
+
+    scaler = GradScaler("cuda", enabled=cfg.get("USE_AMP", True))
 
     # ── W&B (chỉ rank 0) ──────────────────────────────────────────────────────
     wandb_run = None
@@ -215,6 +334,13 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
 
         t_metrics = train_epoch(model, train_loader, optimizer, criterion, device, scaler, rank)
         v_metrics = val_epoch(model, val_loader, criterion, device, rank)
+
+        # ── Step Scheduler ────────────────────────────────────────────────────
+        # ReduceLROnPlateau cần metric; LinearWarmup/Cosine chỉ cần .step()
+        if isinstance(scheduler, ReduceLROnPlateau):
+            scheduler.step(v_metrics["qwk"])
+        else:
+            scheduler.step()
 
         epoch_time = time.time() - epoch_start
 
@@ -246,6 +372,8 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
                     "val/acc":    v_metrics["acc"],
                     "val/qwk":    v_metrics["qwk"],
                     "epoch_time_s": epoch_time,
+                    "lr/head":    optimizer.param_groups[1]["lr"],
+                    "lr/backbone": optimizer.param_groups[0]["lr"],
                 })
 
             # Lưu best model theo val QWK
