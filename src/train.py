@@ -304,7 +304,7 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
-    def run_single_training(cfg: dict) -> None:
+def run_single_training(cfg: dict) -> None:
         """
         Hàm huấn luyện đơn lẻ (Chính là hàm run_training cũ của bạn).
         """
@@ -327,7 +327,7 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
             train_worker(rank=0, world_size=1, cfg=cfg)
 
 
-    def run_grid_search(base_cfg: dict) -> None:
+def run_grid_search(base_cfg: dict) -> None:
         """
         Trình điều khiển chạy nhiều thí nghiệm liên tiếp.
         """
@@ -394,7 +394,7 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
             print("✅ Đã sẵn sàng cho các Cell Evaluation!")
 
 
-    def run_training(cfg: dict) -> None:
+def run_training(cfg: dict) -> None:
         """
         Router (Bộ định tuyến) thay thế cho hàm cũ.
         """
