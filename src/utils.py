@@ -398,6 +398,30 @@ def log_eval_phase_to_wandb(run, metrics: dict, eval_txt_path: str | None = None
             print(f"W&B artifact evaluation_metrics: {e}")
 
 
+def log_predictions_to_wandb(run, pred_csv_path: str) -> None:
+    """
+    Upload predictions.csv lên W&B artifact với tên pred4cam.csv.
+    Gọi sau run_evaluation() trong notebook (cùng đoạn với log_eval_phase_to_wandb).
+
+    Args:
+        run          : wandb.Run đang active (từ resume_wandb_run hoặc setup_wandb)
+        pred_csv_path: Đường dẫn local đến file predictions.csv
+    """
+    if run is None:
+        return
+    if not os.path.isfile(pred_csv_path):
+        print(f"log_predictions_to_wandb: không tìm thấy {pred_csv_path}, bỏ qua.")
+        return
+    try:
+        import wandb
+        art = wandb.Artifact("pred4cam", type="predictions")
+        art.add_file(pred_csv_path, name="pred4cam.csv")
+        run.log_artifact(art)
+        print(f"W&B artifact pred4cam (pred4cam.csv) đã upload từ: {pred_csv_path}")
+    except Exception as e:
+        print(f"W&B artifact pred4cam: {e}")
+
+
 def log_submission_phase_to_wandb(run, submission_path: str, sub_df) -> None:
     """Log phân phối dự đoán trên tập submit + file CSV."""
     if run is None:
