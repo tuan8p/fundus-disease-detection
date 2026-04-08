@@ -14,7 +14,7 @@ Các thành phần chính:
 """
 train.py
 --------
-Pipeline huấn luyện APTOS 2019 với Focal Loss & WeightedRandomSampler.
+Pipeline huấn luyện APTOS 2019 & WeightedRandomSampler.
 Hỗ trợ chạy Local Pass (1 GPU) hoặc DDP (Multi-GPU).
 """
 
@@ -44,29 +44,6 @@ from .models import build_model, predict_labels
 from .evaluate import compute_qwk
 from .utils import save_checkpoint, setup_wandb, save_wandb_run_meta, append_pipeline_log_line
 
-
-# ── Định nghĩa Loss Function ──────────────────────────────────────────────────
-
-class FocalLoss(nn.Module):
-    """
-    Focal Loss chuyên trị Imbalanced Data cho bài toán Phân loại (Classification).
-    """
-    def __init__(self, weight=None, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.gamma = gamma
-        self.weight = weight
-        self.reduction = reduction
-
-    def forward(self, inputs, targets):
-        # Ép kiểu target về long vì classification yêu cầu nhãn là số nguyên
-        targets = targets.long() 
-        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        return focal_loss.sum()
 
 
 # ── DDP helpers ───────────────────────────────────────────────────────────────
@@ -101,13 +78,13 @@ def train_epoch(
 
     for images, labels in pbar:
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        labels = labels.to(device, dtype=torch.float, non_blocking=True)
 
         optimizer.zero_grad()
 
         with autocast("cuda"):
             # Trả về [B, 5] cho bài toán Classification
-            outputs = model(images) 
+            outputs = model(images).view(-1)
             loss = criterion(outputs, labels)
 
         scaler.scale(loss).backward()
@@ -149,10 +126,10 @@ def val_epoch(
     with torch.no_grad():
         for images, labels in pbar:
             images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            labels = labels.to(device, dtype=torch.float, non_blocking=True)
 
             with autocast("cuda"):
-                outputs = model(images) 
+                outputs = model(images).view(-1)
                 loss = criterion(outputs, labels)
 
             total_loss += loss.item()
@@ -207,12 +184,9 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
 
     # ── Optimizer & Loss ──────────────────────────────────────────────────────
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["LR"])
-    
-    # Kích hoạt Focal Loss trị Imbalance
-    criterion = FocalLoss(gamma=2.0)
-    
+    criterion = nn.SmoothL1Loss()
     scaler    = GradScaler("cuda", enabled=cfg.get("USE_AMP", True))
-
+    
     # ── W&B (chỉ rank 0) ──────────────────────────────────────────────────────
     wandb_run = None
     if rank == 0:
