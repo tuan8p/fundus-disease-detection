@@ -316,15 +316,15 @@ def run_grid_search(base_cfg: dict) -> None:
         grid_cfg = copy.deepcopy(base_cfg)
         grid_cfg["EPOCHS"] = min(grid_cfg.get("EPOCHS", 5), 5) 
         
-        preproc_strategies = ["none", "roi", "ben", "clahe"]
-        aug_versions       = ["v1", "v2", "v3"]
+        preproc_strategies = ["roi", "clahe"]
+        aug_versions       = ["v2", "v3"]
         experiments = list(itertools.product(preproc_strategies, aug_versions))
 
         main_output_dir = grid_cfg["OUTPUT_DIR"]
         best_overall_qwk = -1.0
         winning_exp_dir = ""
 
-        print(f"🚀 KÍCH HOẠT AUTO GRID SEARCH: Chạy {len(experiments)} thí nghiệm (Epoch={grid_cfg['EPOCHS']})")
+        print(f"KÍCH HOẠT AUTO GRID SEARCH: Chạy {len(experiments)} thí nghiệm (Epoch={grid_cfg['EPOCHS']})")
 
         for idx, (preproc, aug) in enumerate(experiments, start=1):
             current_cfg = copy.deepcopy(grid_cfg)
@@ -337,7 +337,7 @@ def run_grid_search(base_cfg: dict) -> None:
             current_cfg["WANDB_RUN_NAME"] = f"{grid_cfg['MODEL_TYPE']}_{exp_name}"
 
             print("\n" + "="*70)
-            print(f"🔥 ĐANG CHẠY THÍ NGHIỆM {idx}/{len(experiments)}: [{preproc.upper()}] + [{aug.upper()}]")
+            print(f" ĐANG CHẠY THÍ NGHIỆM {idx}/{len(experiments)}: [{preproc.upper()}] + [{aug.upper()}]")
             print("="*70)
 
             try:
@@ -353,14 +353,14 @@ def run_grid_search(base_cfg: dict) -> None:
                             best_overall_qwk = max_val_qwk
                             winning_exp_dir = exp_dir
             except Exception as e:
-                print(f"❌ Lỗi văng tại {exp_name}: {e}")
+                print(f" Lỗi văng tại {exp_name}: {e}")
 
         print("\n" + "🎉"*15)
         print(f"GRID SEARCH HOÀN TẤT! NHÀ VÔ ĐỊCH: {os.path.basename(winning_exp_dir)} (QWK = {best_overall_qwk:.4f})")
 
         # BƯỚC QUAN TRỌNG: Đẩy model vô địch ra ngoài cho các Cell 6,7,8 của Notebook dùng
         if winning_exp_dir:
-            print("📥 Đang trích xuất Weights & History của nhà vô địch ra thư mục gốc...")
+            print(" Đang trích xuất Weights & History của nhà vô địch ra thư mục gốc...")
             os.makedirs(os.path.join(main_output_dir, "checkpoints"), exist_ok=True)
             
             # Copy Weights
