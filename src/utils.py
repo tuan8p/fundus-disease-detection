@@ -5,7 +5,7 @@ Các tiện ích hỗ trợ pipeline:
 
   - save_checkpoint      : Lưu model state_dict + optimizer + metadata
   - load_checkpoint      : Load lại checkpoint, trả về model + metadata
-  - generate_submission  : Inference trên test.csv → submission.csv (format Kaggle)
+  - generate_submission  : Inference → submission.csv trong output_dir + bản copy ra thư mục cha (submit Kaggle)
   - zip_outputs          : Nén toàn bộ thư mục outputs/ thành outputs.zip
   - setup_wandb          : Khởi tạo W&B run (key từ Kaggle Secrets)
   - start/stop_pipeline_console_capture : Tee stdout/stderr → file (notebook)
@@ -15,8 +15,9 @@ Các tiện ích hỗ trợ pipeline:
 import os
 import sys
 import html
-import zipfile
 import json
+import shutil
+import zipfile
 
 import warnings
 import torch
@@ -227,7 +228,32 @@ def generate_submission(
     df = pd.DataFrame({"id_code": image_ids, "diagnosis": all_preds})
     df.to_csv(sub_path, index=False)
     print(f"Submission saved: {sub_path}  ({len(df)} rows)")
+
+    copy_path = copy_submission_for_kaggle_submit(output_dir)
+    if copy_path:
+        print(f"Copy để submit Competition (ngoài outputs/): {copy_path}")
+
     return sub_path
+
+
+def copy_submission_for_kaggle_submit(output_dir: str, filename: str = "submission.csv") -> str | None:
+    """
+    Copy `output_dir/submission.csv` ra thư mục **cha** của `output_dir` (cùng cấp với folder outputs).
+
+    Ví dụ:
+      - OUTPUT_DIR = `/kaggle/working/outputs` → `/kaggle/working/submission.csv`
+    Trên Kaggle: dùng tab Output hoặc chọn file `submission.csv` ở root working để submit.
+
+    Returns:
+        Đường dẫn file đã copy, hoặc None nếu file nguồn không tồn tại.
+    """
+    src = os.path.join(output_dir, filename)
+    if not os.path.isfile(src):
+        return None
+    parent = os.path.dirname(os.path.abspath(output_dir.rstrip("/\\")))
+    dst = os.path.join(parent, filename)
+    shutil.copy2(src, dst)
+    return dst
 
 
 # ── Zip outputs ───────────────────────────────────────────────────────────────
@@ -370,6 +396,30 @@ def log_eval_phase_to_wandb(run, metrics: dict, eval_txt_path: str | None = None
             run.log_artifact(art)
         except Exception as e:
             print(f"W&B artifact evaluation_metrics: {e}")
+
+
+def log_predictions_to_wandb(run, pred_csv_path: str) -> None:
+    """
+    Upload predictions.csv lên W&B artifact với tên pred4cam.csv.
+    Gọi sau run_evaluation() trong notebook (cùng đoạn với log_eval_phase_to_wandb).
+
+    Args:
+        run          : wandb.Run đang active (từ resume_wandb_run hoặc setup_wandb)
+        pred_csv_path: Đường dẫn local đến file predictions.csv
+    """
+    if run is None:
+        return
+    if not os.path.isfile(pred_csv_path):
+        print(f"log_predictions_to_wandb: không tìm thấy {pred_csv_path}, bỏ qua.")
+        return
+    try:
+        import wandb
+        art = wandb.Artifact("pred4cam", type="predictions")
+        art.add_file(pred_csv_path, name="pred4cam.csv")
+        run.log_artifact(art)
+        print(f"W&B artifact pred4cam (pred4cam.csv) đã upload từ: {pred_csv_path}")
+    except Exception as e:
+        print(f"W&B artifact pred4cam: {e}")
 
 
 def log_submission_phase_to_wandb(run, submission_path: str, sub_df) -> None:
