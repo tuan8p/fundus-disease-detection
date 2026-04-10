@@ -11,17 +11,32 @@ Các thành phần chính:
   - run_training             : Entry point — gọi mp.spawn từ notebook
 """
 
+"""
+train.py
+--------
+Pipeline huấn luyện APTOS 2019 & WeightedRandomSampler.
+Hỗ trợ chạy Local Pass (1 GPU) hoặc DDP (Multi-GPU).
+"""
+
 import os
 import time
 import warnings
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-
-# Dùng torch.amp thay vì torch.cuda.amp (tránh DeprecationWarning từ PyTorch 2.4+)
+#Dùng để chạy grid
+############
+import copy
+import itertools
+import json
+import glob
+import shutil
+##################
 from torch.amp import GradScaler, autocast
 
 from .dataset import get_dataloaders
@@ -30,22 +45,17 @@ from .evaluate import compute_qwk
 from .utils import save_checkpoint, setup_wandb, save_wandb_run_meta, append_pipeline_log_line
 
 
+
 # ── DDP helpers ───────────────────────────────────────────────────────────────
 
 def setup_ddp(rank: int, world_size: int) -> None:
-    """Khởi tạo process group NCCL cho DDP."""
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = "12355"
-    dist.init_process_group(
-        backend="nccl",
-        rank=rank,
-        world_size=world_size,
-    )
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 
 def cleanup_ddp() -> None:
-    """Hủy process group sau khi training xong."""
     dist.destroy_process_group()
 
 
@@ -60,27 +70,21 @@ def train_epoch(
     scaler: GradScaler,
     rank: int,
 ) -> dict:
-    """
-    Chạy 1 epoch training với Mixed Precision (AMP).
-
-    Returns:
-        dict: {"loss": float, "acc": float, "qwk": float}
-    """
     model.train()
     total_loss = 0.0
     all_preds, all_labels = [], []
 
-    # Chỉ hiển thị tqdm ở rank 0 tránh log trùng lặp
     pbar = tqdm(loader, desc="  Train", leave=False, disable=(rank != 0))
 
     for images, labels in pbar:
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        labels = labels.to(device, dtype=torch.float, non_blocking=True)
 
         optimizer.zero_grad()
 
         with autocast("cuda"):
-            outputs = model(images).reshape(-1)  # [B] — an toàn cho cả [B,1] và [B]
+            # Trả về [B, 5] cho bài toán Classification
+            outputs = model(images).view(-1)
             loss = criterion(outputs, labels)
 
         scaler.scale(loss).backward()
@@ -88,6 +92,8 @@ def train_epoch(
         scaler.update()
 
         total_loss += loss.item()
+        
+        # predict_labels bây giờ dùng argmax
         preds = predict_labels(outputs.detach())
         all_preds.extend(preds.cpu().tolist())
         all_labels.extend(labels.long().cpu().tolist())
@@ -111,12 +117,6 @@ def val_epoch(
     device: torch.device,
     rank: int,
 ) -> dict:
-    """
-    Chạy 1 epoch validation với Mixed Precision (AMP), không update gradient.
-
-    Returns:
-        dict: {"loss": float, "acc": float, "qwk": float}
-    """
     model.eval()
     total_loss = 0.0
     all_preds, all_labels = [], []
@@ -126,10 +126,10 @@ def val_epoch(
     with torch.no_grad():
         for images, labels in pbar:
             images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+            labels = labels.to(device, dtype=torch.float, non_blocking=True)
 
             with autocast("cuda"):
-                outputs = model(images).reshape(-1)  # [B]
+                outputs = model(images).view(-1)
                 loss = criterion(outputs, labels)
 
             total_loss += loss.item()
@@ -147,24 +147,18 @@ def val_epoch(
 # ── Worker (1 process per GPU) ────────────────────────────────────────────────
 
 def train_worker(rank: int, world_size: int, cfg: dict) -> None:
-    """
-    Hàm chạy trong mỗi tiến trình DDP (target của mp.spawn).
-
-    Args:
-        rank       : GPU index (0 hoặc 1)
-        world_size : Tổng số GPU (2)
-        cfg        : Dict thông số từ Cell 2 của notebook
-    """
-    # Tắt toàn bộ warning trong child processes (FutureWarning, UserWarning, v.v.)
     warnings.filterwarnings("ignore")
 
-    setup_ddp(rank, world_size)
+    use_ddp = world_size > 1
+    if use_ddp:
+        setup_ddp(rank, world_size)
+    
     device = torch.device(f"cuda:{rank}")
 
     if rank == 0:
         append_pipeline_log_line(
             cfg["OUTPUT_DIR"],
-            "\n--- DDP training (rank 0) — log từ worker, không qua tee notebook ---\n",
+            f"\n--- Bắt đầu huấn luyện trên {'DDP (' + str(world_size) + ' GPUs)' if use_ddp else 'Local (1 GPU)'} ---\n",
             rank,
         )
 
@@ -173,23 +167,26 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
         data_dir=cfg["DATA_DIR"],
         image_size=cfg["IMAGE_SIZE"],
         batch_size=cfg["BATCH_SIZE"],
+        aug_version=cfg.get("AUGMENT_VERSION", "v1"),
         num_workers=cfg["NUM_WORKERS"],
         train_ratio=cfg["TRAIN_RATIO"],
         val_ratio=cfg["VAL_RATIO"],
         seed=cfg["SEED"],
         rank=rank,
         world_size=world_size,
+        preprocessing_strategy=cfg.get("PREPROCESSING_STRATEGY", "none"),
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(cfg["MODEL_TYPE"]).to(device)
-    model = DDP(model, device_ids=[rank], output_device=rank)
+    if use_ddp:
+        model = DDP(model, device_ids=[rank], output_device=rank)
 
     # ── Optimizer & Loss ──────────────────────────────────────────────────────
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg["LR"])
     criterion = nn.SmoothL1Loss()
     scaler    = GradScaler("cuda", enabled=cfg.get("USE_AMP", True))
-
+    
     # ── W&B (chỉ rank 0) ──────────────────────────────────────────────────────
     wandb_run = None
     if rank == 0:
@@ -208,7 +205,9 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for epoch in range(1, cfg["EPOCHS"] + 1):
-        if train_sampler is not None:
+        
+        # BẢO VỆ SAMPLER: Chỉ gọi set_epoch nếu là DDP Sampler
+        if train_sampler is not None and isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
 
         epoch_start = time.time()
@@ -219,12 +218,10 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
         epoch_time = time.time() - epoch_start
 
         if rank == 0:
-            # Ghi history
             for k in ["loss", "acc", "qwk"]:
                 history[f"train_{k}"].append(t_metrics[k])
                 history[f"val_{k}"].append(v_metrics[k])
 
-            # Log ra console + file pipeline (DDP không dùng tee của notebook)
             _line = (
                 f"Epoch [{epoch:02d}/{cfg['EPOCHS']}] "
                 f"| Time: {epoch_time:.1f}s "
@@ -234,7 +231,6 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
             print(_line)
             append_pipeline_log_line(cfg["OUTPUT_DIR"], _line, rank)
 
-            # W&B log
             if wandb_run is not None:
                 import wandb
                 wandb.log({
@@ -248,15 +244,17 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
                     "epoch_time_s": epoch_time,
                 })
 
-            # Lưu best model theo val QWK
             if v_metrics["qwk"] > best_val_qwk:
                 best_val_qwk = v_metrics["qwk"]
                 ckpt_path = os.path.join(
                     cfg["OUTPUT_DIR"], "checkpoints",
                     f"best_model_{cfg['MODEL_TYPE']}.pth"
                 )
-                # Lưu state_dict của module bên trong DDP wrapper
-                save_checkpoint(model.module, optimizer, epoch, v_metrics, ckpt_path)
+                
+                # Lưu state_dict: Xử lý an toàn cho cả model thường và model bọc DDP
+                model_to_save = model.module if hasattr(model, 'module') else model
+                save_checkpoint(model_to_save, optimizer, epoch, v_metrics, ckpt_path)
+                
                 _bm = f"  ✓ Best model saved  (val QWK = {best_val_qwk:.4f})"
                 print(_bm)
                 append_pipeline_log_line(cfg["OUTPUT_DIR"], _bm, rank)
@@ -264,55 +262,129 @@ def train_worker(rank: int, world_size: int, cfg: dict) -> None:
     if rank == 0:
         if wandb_run is not None:
             import wandb
-            # Giai đoạn training kết thúc — log + lưu id run để notebook resume và log tiếp eval/submit/figures
             wandb.log({
                 "pipeline/stage": "training_complete",
                 "train/best_val_qwk": float(best_val_qwk),
             })
             save_wandb_run_meta(cfg["OUTPUT_DIR"], wandb.run)
             wandb.finish()
-        # Lưu history để notebook đọc lại
+            
         import json
         history_path = os.path.join(cfg["OUTPUT_DIR"], "history.json")
         with open(history_path, "w") as f:
             json.dump(history, f, indent=2)
+            
         _done = f"\nTraining hoàn tất. Best val QWK = {best_val_qwk:.4f}"
         print(_done)
         append_pipeline_log_line(cfg["OUTPUT_DIR"], _done.strip(), rank)
 
-    cleanup_ddp()
+    if use_ddp:
+        cleanup_ddp()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+
+def run_single_training(cfg: dict) -> None:
+        """
+        Hàm huấn luyện đơn lẻ (Chính là hàm run_training cũ của bạn).
+        """
+        warnings.filterwarnings("ignore")
+        world_size = torch.cuda.device_count()
+        if world_size == 0:
+            raise RuntimeError("Không tìm thấy GPU. Hãy kiểm tra lại môi trường.")
+
+        repo_root = cfg.get("REPO_ROOT", "")
+        if repo_root:
+            sep = ":" if os.name != "nt" else ";"
+            existing = os.environ.get("PYTHONPATH", "")
+            os.environ["PYTHONPATH"] = repo_root + (sep + existing if existing else "")
+
+        if world_size > 1:
+            print(f"Bắt đầu DDP training trên {world_size} GPU(s)...")
+            mp.spawn(train_worker, args=(world_size, cfg), nprocs=world_size, join=True)
+        else:
+            print("Phát hiện 1 GPU. Bắt đầu huấn luyện Local Pass...")
+            train_worker(rank=0, world_size=1, cfg=cfg)
+
+
+def run_grid_search(base_cfg: dict) -> None:
+        """
+        Trình điều khiển chạy nhiều thí nghiệm liên tiếp.
+        """
+        # Ép Epochs = 5 để chống sập server Kaggle khi chạy 12 models
+        grid_cfg = copy.deepcopy(base_cfg)
+        grid_cfg["EPOCHS"] = min(grid_cfg.get("EPOCHS", 5), 5) 
+        
+        preproc_strategies = ["roi", "clahe"]
+        aug_versions       = ["v2", "v3"]
+        experiments = list(itertools.product(preproc_strategies, aug_versions))
+
+        main_output_dir = grid_cfg["OUTPUT_DIR"]
+        best_overall_qwk = -1.0
+        winning_exp_dir = ""
+
+        print(f"KÍCH HOẠT AUTO GRID SEARCH: Chạy {len(experiments)} thí nghiệm (Epoch={grid_cfg['EPOCHS']})")
+
+        for idx, (preproc, aug) in enumerate(experiments, start=1):
+            current_cfg = copy.deepcopy(grid_cfg)
+            current_cfg["PREPROCESSING_STRATEGY"] = preproc
+            current_cfg["AUGMENT_VERSION"] = aug
+            
+            exp_name = f"exp_{idx:02d}_{preproc}_{aug}"
+            exp_dir = os.path.join(main_output_dir, exp_name)
+            current_cfg["OUTPUT_DIR"] = exp_dir
+            current_cfg["WANDB_RUN_NAME"] = f"{grid_cfg['MODEL_TYPE']}_{exp_name}"
+
+            print("\n" + "="*70)
+            print(f" ĐANG CHẠY THÍ NGHIỆM {idx}/{len(experiments)}: [{preproc.upper()}] + [{aug.upper()}]")
+            print("="*70)
+
+            try:
+                run_single_training(current_cfg)
+
+                # Đọc file history để tìm model ngon nhất
+                history_path = os.path.join(exp_dir, "history.json")
+                if os.path.exists(history_path):
+                    with open(history_path, 'r') as f:
+                        hist = json.load(f)
+                        max_val_qwk = max(hist.get("val_qwk", [0]))
+                        if max_val_qwk > best_overall_qwk:
+                            best_overall_qwk = max_val_qwk
+                            winning_exp_dir = exp_dir
+            except Exception as e:
+                print(f" Lỗi văng tại {exp_name}: {e}")
+
+        print("\n" + "🎉"*15)
+        print(f"GRID SEARCH HOÀN TẤT! NHÀ VÔ ĐỊCH: {os.path.basename(winning_exp_dir)} (QWK = {best_overall_qwk:.4f})")
+
+        # BƯỚC QUAN TRỌNG: Đẩy model vô địch ra ngoài cho các Cell 6,7,8 của Notebook dùng
+        if winning_exp_dir:
+            print(" Đang trích xuất Weights & History của nhà vô địch ra thư mục gốc...")
+            os.makedirs(os.path.join(main_output_dir, "checkpoints"), exist_ok=True)
+            
+            # Copy Weights
+            for file in glob.glob(os.path.join(winning_exp_dir, "checkpoints", "*.pth")):
+                shutil.copy(file, os.path.join(main_output_dir, "checkpoints", os.path.basename(file)))
+            
+            # Copy History
+            history_src = os.path.join(winning_exp_dir, "history.json")
+            if os.path.exists(history_src):
+                shutil.copy(history_src, os.path.join(main_output_dir, "history.json"))
+            
+            print("✅ Đã sẵn sàng cho các Cell Evaluation!")
+
+
 def run_training(cfg: dict) -> None:
-    """
-    Khởi động DDP training bằng mp.spawn.
-    Gọi hàm này từ notebook (Cell 5).
+        """
+        Router (Bộ định tuyến) thay thế cho hàm cũ.
+        """
+        preproc = cfg.get("PREPROCESSING_STRATEGY", "none")
+        aug = cfg.get("AUGMENT_VERSION", "v1")
 
-    Args:
-        cfg (dict): Toàn bộ thông số từ Cell 2 của notebook.
-                    Phải có key "REPO_ROOT" để child processes tìm được src/.
-    """
-    # Tắt warning trong main process (FutureWarning từ mp.spawn, v.v.)
-    warnings.filterwarnings("ignore")
-
-    world_size = torch.cuda.device_count()
-    if world_size == 0:
-        raise RuntimeError("Không tìm thấy GPU. Hãy kiểm tra lại môi trường.")
-
-    # mp.spawn tạo process mới với Python path trắng (không kế thừa sys.path
-    # từ notebook). Fix: set PYTHONPATH env var — được kế thừa bởi child processes.
-    repo_root = cfg.get("REPO_ROOT", "")
-    if repo_root:
-        sep = ":" if os.name != "nt" else ";"
-        existing = os.environ.get("PYTHONPATH", "")
-        os.environ["PYTHONPATH"] = repo_root + (sep + existing if existing else "")
-
-    print(f"Bắt đầu DDP training trên {world_size} GPU(s)...")
-    mp.spawn(
-        train_worker,
-        args=(world_size, cfg),
-        nprocs=world_size,
-        join=True,
-    )
+        # Nếu User truyền vào chữ "all", ta bẻ lái sang luồng Grid Search
+        if preproc == "all" or aug == "all":
+            run_grid_search(cfg)
+        else:
+            # Chạy bình thường
+            run_single_training(cfg)

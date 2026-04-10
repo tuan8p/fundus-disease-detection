@@ -203,4 +203,25 @@ def run_evaluation(
         f.write(full_text)
     print(f"Classification report (same content) : {report_path}")
 
+    # ── Lưu predictions.csv (image_path, true_label, pred_label, correct) ────
+    try:
+        import csv
+        ds = loader.dataset
+        image_dir = ds.image_dir
+        image_ids = ds.image_ids
+
+        pred_csv_path = os.path.join(output_dir, "predictions.csv")
+        with open(pred_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["image_path", "true_label", "pred_label", "correct"])
+            for img_id, true, pred in zip(image_ids, all_labels, all_preds):
+                img_path = os.path.join(image_dir, f"{img_id}.png")
+                writer.writerow([img_path, true, pred, int(true == pred)])
+
+        n_correct = sum(t == p for t, p in zip(all_labels, all_preds))
+        print(f"Predictions CSV đã lưu tại  : {pred_csv_path}")
+        print(f"  ✅ Đúng: {n_correct} / {len(all_labels)}  |  ❌ Sai: {len(all_labels) - n_correct} / {len(all_labels)}")
+    except AttributeError:
+        pass  # loader không có dataset chuẩn, bỏ qua
+
     return metrics
