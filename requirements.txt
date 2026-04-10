@@ -1,9 +1,9 @@
 # Core deep learning
-torch>=2.0.0
-torchvision>=0.15.0
+# torch>=2.0.0
+# torchvision>=0.15.0
 
 # Model zoo — pretrained weights from HuggingFace Hub
-timm>=0.9.0
+# timm>=0.9.0
 
 # Data & ML utilities
 numpy>=1.24.0
@@ -11,6 +11,8 @@ pandas>=1.5.0
 scikit-learn>=1.2.0
 Pillow>=9.0.0
 opencv-python-headless>=4.8.0
+# Cap <1.4.8: newer releases pull stringzilla, which often has no wheel on Python 3.14/Windows (needs MSVC).
+albumentations>=1.4.7
 
 # Experiment tracking
 wandb>=0.15.0
