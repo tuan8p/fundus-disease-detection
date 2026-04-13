@@ -22,19 +22,33 @@ Phân loại mức độ bệnh võng mạc tiểu đường từ ảnh fundus, 
 
 ```
 fundus-disease-detection/
-├── README.md
-├── requirements.txt
-├── notebooks/
-│   └── baseline.ipynb          # Notebook chính — chạy toàn bộ pipeline
-└── src/
-    ├── __init__.py
-    ├── dataset.py              # Dataset, transforms, dataloaders
-    ├── models.py               # Factory tạo model + freeze strategy
-    ├── train.py                # Training loop với DDP + AMP + scheduler
-    ├── evaluate.py             # Tính toán metrics
-    ├── visualize.py            # Vẽ figures đánh giá
-    ├── xai.py                  # Explainability (GradCAM, v.v.)
-    └── utils.py                # Checkpoint, submission CSV, zip outputs, W&B
+│
+├── README.md                     
+├── notebooks/                    
+│   ├── baseline.ipynb           
+│   └── run_optuna_shard_swin_kaggle.ipynb      
+│   
+│
+├── src/                          
+│   ├── __init__.py
+│   ├── dataset.py               
+│   ├── models.py                 
+│   ├── train.py                 
+│   ├── evaluate.py
+│   ├── eda.py                 
+│   ├── xai.py                    
+│   └── utils.py                  
+│
+└── web/                         
+    ├── frontend/                 
+    │   ├── app/                  
+    │   └── public/               
+    │
+    └── backend/                 
+        ├── main.py               
+        ├── api/                  
+        ├── service/              
+        └──  model/                
 ```
 
 ---
