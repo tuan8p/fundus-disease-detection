@@ -1,0 +1,13 @@
+fastapi==0.135.2
+Pillow==12.1.1
+protobuf==7.34.1
+uvicorn==0.42.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.11.0+cpu
+torchvision==0.26.0+cpu
+google-genai
+python-multipart
+python-dotenv
+opencv-python
+grad-cam
+timm
